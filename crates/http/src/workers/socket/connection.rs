@@ -161,7 +161,17 @@ where
         opt_stable_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         loop {
-            let (request, opt_peer_addr) = self.read_request().await?;
+            let (request, opt_peer_addr) = match self.read_request().await {
+                Ok(request) => request,
+                Err(ConnectionError::RequestParse(err)) => {
+                    let response = request_parse_error_response(err);
+
+                    self.write_response(&response, None).await?;
+
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
 
             let peer_addr = opt_stable_peer_addr
                 .or(opt_peer_addr)
@@ -169,7 +179,7 @@ where
 
             let response = self.handle_request(request, peer_addr).await?;
 
-            self.write_response(&response, peer_addr).await?;
+            self.write_response(&response, Some(peer_addr)).await?;
 
             if !self.config.network.keep_alive {
                 break;
@@ -391,7 +401,7 @@ where
     async fn write_response(
         &mut self,
         response: &Response,
-        peer_addr: CanonicalSocketAddr,
+        opt_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         let position = write_response_to_buffer(&mut self.response_buffer, response)?;
 
@@ -403,21 +413,23 @@ where
 
         #[cfg(feature = "metrics")]
         {
-            let response_type = match response {
-                Response::Announce(_) => "announce",
-                Response::Scrape(_) => "scrape",
-                Response::Failure(_) => "error",
-            };
+            if let Some(peer_addr) = opt_peer_addr {
+                let response_type = match response {
+                    Response::Announce(_) => "announce",
+                    Response::Scrape(_) => "scrape",
+                    Response::Failure(_) => "error",
+                };
 
-            let ip_version_str = peer_addr_to_ip_version_str(&peer_addr);
+                let ip_version_str = peer_addr_to_ip_version_str(&peer_addr);
 
-            ::metrics::counter!(
-                "aquatic_responses_total",
-                "type" => response_type,
-                "ip_version" => ip_version_str,
-                "worker_index" => self.worker_index_string.clone(),
-            )
-            .increment(1);
+                ::metrics::counter!(
+                    "aquatic_responses_total",
+                    "type" => response_type,
+                    "ip_version" => ip_version_str,
+                    "worker_index" => self.worker_index_string.clone(),
+                )
+                .increment(1);
+            }
         }
 
         Ok(())
@@ -466,6 +478,10 @@ fn required_peer_ip_header_missing_error(err: anyhow::Error) -> ConnectionError 
     ConnectionError::RequestParse(err.context("required peer ip header missing or invalid"))
 }
 
+fn request_parse_error_response(err: anyhow::Error) -> Response {
+    Response::Failure(FailureResponse::new(format!("Invalid request: {:#}", err)))
+}
+
 #[cfg(test)]
 mod tests {
     use aquatic_http_protocol::{
@@ -477,8 +493,9 @@ mod tests {
     use crate::config::Config;
 
     use super::{
-        required_peer_ip_header_missing_error, write_response_to_buffer, ConnectionError,
-        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
+        request_parse_error_response, required_peer_ip_header_missing_error,
+        write_response_to_buffer, ConnectionError, REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE,
+        RESPONSE_HEADER_A,
     };
 
     #[test]
@@ -505,6 +522,58 @@ mod tests {
 
         assert!(matches!(err, ConnectionError::RequestParse(_)));
         assert!(format!("{:#}", err).contains("required peer ip header missing or invalid"));
+    }
+
+    #[test]
+    fn test_request_parse_error_is_written_as_failure_response() {
+        const INFO_HASH: &str = "%E0%79%A8%4C%16%05%72%D7%54%8F%63%24%EE%E6%5B%69%5E%87%77%E9";
+        const PEER_ID: &str = "-ABC940-5ert69muw5t8";
+
+        for (path, expected_detail) in [
+            (
+                format!(
+                    "/announce?peer_id={PEER_ID}&port=12345&uploaded=1&downloaded=2&left=3"
+                ),
+                "no info_hash",
+            ),
+            (format!("/announce?info_hash={INFO_HASH}"), "no peer_id"),
+            (
+                format!("/announce?info_hash={INFO_HASH}&peer_id={PEER_ID}&uploaded=1&downloaded=2&left=3"),
+                "no port",
+            ),
+            (
+                format!("/announce?info_hash={INFO_HASH}&peer_id={PEER_ID}&port=12345&downloaded=2&left=3"),
+                "no uploaded",
+            ),
+            (
+                format!("/announce?info_hash={INFO_HASH}&peer_id={PEER_ID}&port=12345&uploaded=1&left=3"),
+                "no downloaded",
+            ),
+            (
+                format!("/announce?info_hash={INFO_HASH}&peer_id={PEER_ID}&port=12345&uploaded=1&downloaded=2"),
+                "no left",
+            ),
+            (
+                format!("/announce?info_hash={INFO_HASH}&peer_id={PEER_ID}&port=abc&uploaded=1&downloaded=2&left=3"),
+                "parse port",
+            ),
+        ] {
+            let err = Request::parse_http_get_path(&path).unwrap_err();
+            let response = request_parse_error_response(err);
+            let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+            write_response_to_buffer(&mut response_buffer, &response).unwrap();
+
+            let response = std::str::from_utf8(&response_buffer).unwrap();
+
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK\r\nContent-Length: "),
+                "{path}"
+            );
+            assert!(response.contains("d14:failure reason"), "{path}");
+            assert!(response.contains("Invalid request"), "{path}");
+            assert!(response.contains(expected_detail), "{path}");
+        }
     }
 
     #[test]
