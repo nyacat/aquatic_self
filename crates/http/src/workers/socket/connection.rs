@@ -223,7 +223,7 @@ where
                 }
                 Err(RequestParseError::MoreDataNeeded) => continue,
                 Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
-                    panic!("Tracker configured as running behind reverse proxy, but no corresponding IP header set in request. Please check your reverse proxy setup as well as your aquatic configuration. Error: {:#}", err);
+                    return Err(required_peer_ip_header_missing_error(err));
                 }
                 Err(RequestParseError::InvalidRequest(err)) => {
                     return Err(ConnectionError::RequestParse(err));
@@ -471,6 +471,10 @@ fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usi
     (info_hash.0[0] as usize) % config.swarm_workers
 }
 
+fn required_peer_ip_header_missing_error(err: anyhow::Error) -> ConnectionError {
+    ConnectionError::RequestParse(err.context("required peer ip header missing or invalid"))
+}
+
 #[cfg(test)]
 mod tests {
     use aquatic_http_protocol::{
@@ -480,7 +484,7 @@ mod tests {
 
     use crate::config::Config;
 
-    use super::REQUEST_BUFFER_SIZE;
+    use super::{required_peer_ip_header_missing_error, ConnectionError, REQUEST_BUFFER_SIZE};
 
     #[test]
     fn default_request_buffer_fits_configured_max_scrape_request() {
@@ -498,5 +502,13 @@ mod tests {
             bytes.len(),
             REQUEST_BUFFER_SIZE
         );
+    }
+
+    #[test]
+    fn test_required_peer_ip_header_missing_is_connection_parse_error() {
+        let err = required_peer_ip_header_missing_error(anyhow::anyhow!("header not present"));
+
+        assert!(matches!(err, ConnectionError::RequestParse(_)));
+        assert!(format!("{:#}", err).contains("required peer ip header missing or invalid"));
     }
 }

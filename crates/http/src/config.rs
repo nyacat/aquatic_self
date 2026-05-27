@@ -118,7 +118,10 @@ pub struct NetworkConfig {
     /// More info on what can go wrong when running behind reverse proxies:
     /// https://adam-p.ca/blog/2022/03/x-forwarded-for/
     pub runs_behind_reverse_proxy: bool,
-    /// Name of header set by reverse proxy to indicate peer ip
+    /// Name of header set by reverse proxy to indicate peer ip.
+    ///
+    /// A comma-separated list may be used when several trusted proxies set
+    /// different headers. Earlier names have higher precedence.
     pub reverse_proxy_ip_header_name: String,
     /// How to extract peer IP from header field
     ///
