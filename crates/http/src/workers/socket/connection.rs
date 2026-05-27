@@ -82,9 +82,7 @@ pub(super) async fn run_connection(
     let access_list_cache = create_access_list_cache(&access_list);
     let request_buffer = Box::new([0u8; REQUEST_BUFFER_SIZE]);
 
-    let mut response_buffer = Box::new([0; RESPONSE_BUFFER_SIZE]);
-
-    response_buffer[..RESPONSE_HEADER.len()].copy_from_slice(&RESPONSE_HEADER);
+    let response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
 
     let remote_addr = stream
         .peer_addr()
@@ -148,7 +146,7 @@ struct Connection<S> {
     peer_port: u16,
     request_buffer: Box<[u8; REQUEST_BUFFER_SIZE]>,
     request_buffer_position: usize,
-    response_buffer: Box<[u8; RESPONSE_BUFFER_SIZE]>,
+    response_buffer: Vec<u8>,
     stream: S,
     worker_index_string: String,
 }
@@ -395,48 +393,7 @@ where
         response: &Response,
         peer_addr: CanonicalSocketAddr,
     ) -> Result<(), ConnectionError> {
-        // Write body and final newline to response buffer
-
-        let mut position = RESPONSE_HEADER.len();
-
-        let body_len = response
-            .write_bytes(&mut &mut self.response_buffer[position..])
-            .map_err(ConnectionError::ResponseBufferWrite)?;
-
-        position += body_len;
-
-        if position + 2 > self.response_buffer.len() {
-            return Err(ConnectionError::ResponseBufferFull);
-        }
-
-        self.response_buffer[position..position + 2].copy_from_slice(b"\r\n");
-
-        position += 2;
-
-        let content_len = body_len + 2;
-
-        // Clear content-len header value
-
-        {
-            let start = RESPONSE_HEADER_A.len();
-            let end = start + RESPONSE_HEADER_B.len();
-
-            self.response_buffer[start..end].copy_from_slice(RESPONSE_HEADER_B);
-        }
-
-        // Set content-len header value
-
-        {
-            let mut buf = ::itoa::Buffer::new();
-            let content_len_bytes = buf.format(content_len).as_bytes();
-
-            let start = RESPONSE_HEADER_A.len();
-            let end = start + content_len_bytes.len();
-
-            self.response_buffer[start..end].copy_from_slice(content_len_bytes);
-        }
-
-        // Write buffer to stream
+        let position = write_response_to_buffer(&mut self.response_buffer, response)?;
 
         self.stream
             .write(&self.response_buffer[..position])
@@ -471,6 +428,40 @@ fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usi
     (info_hash.0[0] as usize) % config.swarm_workers
 }
 
+fn write_response_to_buffer(
+    response_buffer: &mut Vec<u8>,
+    response: &Response,
+) -> Result<usize, ConnectionError> {
+    response_buffer.clear();
+    response_buffer.extend_from_slice(&RESPONSE_HEADER);
+
+    let body_start = response_buffer.len();
+
+    response
+        .write_bytes(response_buffer)
+        .map_err(ConnectionError::ResponseBufferWrite)?;
+
+    response_buffer.extend_from_slice(b"\r\n");
+
+    let content_len = response_buffer.len() - body_start;
+
+    {
+        let mut buf = ::itoa::Buffer::new();
+        let content_len_bytes = buf.format(content_len).as_bytes();
+
+        let start = RESPONSE_HEADER_A.len();
+        let end = start + content_len_bytes.len();
+
+        if end > RESPONSE_HEADER_A.len() + RESPONSE_HEADER_B.len() {
+            return Err(ConnectionError::ResponseBufferFull);
+        }
+
+        response_buffer[start..end].copy_from_slice(content_len_bytes);
+    }
+
+    Ok(response_buffer.len())
+}
+
 fn required_peer_ip_header_missing_error(err: anyhow::Error) -> ConnectionError {
     ConnectionError::RequestParse(err.context("required peer ip header missing or invalid"))
 }
@@ -480,11 +471,15 @@ mod tests {
     use aquatic_http_protocol::{
         common::InfoHash,
         request::{Request, ScrapeRequest},
+        response::{Response, ScrapeResponse, ScrapeStatistics},
     };
 
     use crate::config::Config;
 
-    use super::{required_peer_ip_header_missing_error, ConnectionError, REQUEST_BUFFER_SIZE};
+    use super::{
+        required_peer_ip_header_missing_error, write_response_to_buffer, ConnectionError,
+        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
+    };
 
     #[test]
     fn default_request_buffer_fits_configured_max_scrape_request() {
@@ -510,5 +505,49 @@ mod tests {
 
         assert!(matches!(err, ConnectionError::RequestParse(_)));
         assert!(format!("{:#}", err).contains("required peer ip header missing or invalid"));
+    }
+
+    #[test]
+    fn test_write_response_to_buffer_handles_default_max_scrape_response() {
+        let config = Config::default();
+        let response = Response::Scrape(ScrapeResponse {
+            files: (0..config.protocol.max_scrape_torrents)
+                .map(|index| {
+                    let mut bytes = [0; 20];
+                    bytes[16..].copy_from_slice(&(index as u32).to_be_bytes());
+
+                    (
+                        InfoHash(bytes),
+                        ScrapeStatistics {
+                            complete: usize::MAX,
+                            downloaded: usize::MAX,
+                            incomplete: usize::MAX,
+                        },
+                    )
+                })
+                .collect(),
+        });
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        let written = write_response_to_buffer(&mut response_buffer, &response).unwrap();
+
+        assert_eq!(written, response_buffer.len());
+        assert!(response_buffer.len() > RESPONSE_BUFFER_SIZE);
+        assert!(response_buffer.starts_with(RESPONSE_HEADER_A));
+        assert!(response_buffer.ends_with(b"\r\n"));
+
+        let header_end = response_buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let header = std::str::from_utf8(&response_buffer[..header_end]).unwrap();
+        let content_len = header
+            .strip_prefix("HTTP/1.1 200 OK\r\nContent-Length: ")
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+
+        assert_eq!(content_len, response_buffer.len() - header_end - 4);
     }
 }
