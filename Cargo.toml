@@ -40,9 +40,12 @@ aquatic_ws_protocol = { version = "0.9.0", path = "./crates/ws_protocol" }
 aquatic_ws = { version = "0.9.0", path = "./crates/ws" }
 
 [profile.release]
+codegen-units = 1
 debug = false
-lto = "thin"
+lto = "fat"
 opt-level = 3
+panic = "abort"
+strip = "symbols"
 
 [profile.test]
 inherits = "release-debug"
