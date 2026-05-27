@@ -163,14 +163,14 @@ where
         loop {
             let (request, opt_peer_addr) = match self.read_request().await {
                 Ok(request) => request,
-                Err(ConnectionError::RequestParse(err)) => {
-                    let response = request_parse_error_response(err);
+                Err(err) => match request_read_error_response(err) {
+                    Ok(response) => {
+                        self.write_response(&response, None).await?;
 
-                    self.write_response(&response, None).await?;
-
-                    break;
-                }
-                Err(err) => return Err(err),
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                },
             };
 
             let peer_addr = opt_stable_peer_addr
@@ -482,6 +482,16 @@ fn request_parse_error_response(err: anyhow::Error) -> Response {
     Response::Failure(FailureResponse::new(format!("Invalid request: {:#}", err)))
 }
 
+fn request_read_error_response(err: ConnectionError) -> Result<Response, ConnectionError> {
+    match err {
+        ConnectionError::RequestParse(err) => Ok(request_parse_error_response(err)),
+        ConnectionError::RequestBufferFull => Ok(Response::Failure(FailureResponse::new(
+            "Request too large: HTTP request headers exceed the request buffer",
+        ))),
+        err => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aquatic_http_protocol::{
@@ -493,9 +503,9 @@ mod tests {
     use crate::config::Config;
 
     use super::{
-        request_parse_error_response, required_peer_ip_header_missing_error,
-        write_response_to_buffer, ConnectionError, REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE,
-        RESPONSE_HEADER_A,
+        request_parse_error_response, request_read_error_response,
+        required_peer_ip_header_missing_error, write_response_to_buffer, ConnectionError,
+        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
     };
 
     #[test]
@@ -574,6 +584,20 @@ mod tests {
             assert!(response.contains("Invalid request"), "{path}");
             assert!(response.contains(expected_detail), "{path}");
         }
+    }
+
+    #[test]
+    fn test_request_buffer_full_is_written_as_failure_response() {
+        let response = request_read_error_response(ConnectionError::RequestBufferFull).unwrap();
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        write_response_to_buffer(&mut response_buffer, &response).unwrap();
+
+        let response = std::str::from_utf8(&response_buffer).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\nContent-Length: "));
+        assert!(response.contains("d14:failure reason"));
+        assert!(response.contains("Request too large"));
     }
 
     #[test]
