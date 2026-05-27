@@ -29,7 +29,7 @@ use crate::config::Config;
 use super::peer_addr_to_ip_version_str;
 use super::request::{parse_request, RequestParseError};
 
-const REQUEST_BUFFER_SIZE: usize = 2048;
+const REQUEST_BUFFER_SIZE: usize = 16 * 1024;
 const RESPONSE_BUFFER_SIZE: usize = 4096;
 
 const RESPONSE_HEADER_A: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: ";
@@ -52,6 +52,8 @@ pub enum ConnectionError {
     NoSocketPeerAddr(String),
     #[error("request buffer full")]
     RequestBufferFull,
+    #[error("request parse error: {0}")]
+    RequestParse(anyhow::Error),
     #[error("response buffer full")]
     ResponseBufferFull,
     #[error("response buffer write error: {0}")]
@@ -223,8 +225,8 @@ where
                 Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
                     panic!("Tracker configured as running behind reverse proxy, but no corresponding IP header set in request. Please check your reverse proxy setup as well as your aquatic configuration. Error: {:#}", err);
                 }
-                Err(RequestParseError::Other(err)) => {
-                    ::log::debug!("Failed parsing request: {:#}", err);
+                Err(RequestParseError::InvalidRequest(err)) => {
+                    return Err(ConnectionError::RequestParse(err));
                 }
             }
         }
@@ -467,4 +469,34 @@ where
 
 fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usize {
     (info_hash.0[0] as usize) % config.swarm_workers
+}
+
+#[cfg(test)]
+mod tests {
+    use aquatic_http_protocol::{
+        common::InfoHash,
+        request::{Request, ScrapeRequest},
+    };
+
+    use crate::config::Config;
+
+    use super::REQUEST_BUFFER_SIZE;
+
+    #[test]
+    fn default_request_buffer_fits_configured_max_scrape_request() {
+        let config = Config::default();
+        let request = Request::Scrape(ScrapeRequest {
+            info_hashes: vec![InfoHash([0xff; 20]); config.protocol.max_scrape_torrents],
+        });
+        let mut bytes = Vec::new();
+
+        request.write(&mut bytes, &[]).unwrap();
+
+        assert!(
+            bytes.len() <= REQUEST_BUFFER_SIZE,
+            "default scrape request can be {} bytes, but request buffer is {} bytes",
+            bytes.len(),
+            REQUEST_BUFFER_SIZE
+        );
+    }
 }

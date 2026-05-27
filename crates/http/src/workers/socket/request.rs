@@ -9,10 +9,10 @@ use crate::config::{Config, ReverseProxyPeerIpHeaderFormat};
 pub enum RequestParseError {
     #[error("required peer ip header missing or invalid")]
     RequiredPeerIpHeaderMissing(anyhow::Error),
+    #[error("invalid request")]
+    InvalidRequest(anyhow::Error),
     #[error("more data needed")]
     MoreDataNeeded,
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 pub fn parse_request(
@@ -22,10 +22,18 @@ pub fn parse_request(
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut http_request = httparse::Request::new(&mut headers);
 
-    match http_request.parse(buffer).with_context(|| "httparse")? {
+    match http_request
+        .parse(buffer)
+        .with_context(|| "httparse")
+        .map_err(RequestParseError::InvalidRequest)?
+    {
         httparse::Status::Complete(_) => {
-            let path = http_request.path.ok_or(anyhow::anyhow!("no http path"))?;
-            let request = Request::parse_http_get_path(path)?;
+            let path = http_request
+                .path
+                .ok_or(anyhow::anyhow!("no http path"))
+                .map_err(RequestParseError::InvalidRequest)?;
+            let request =
+                Request::parse_http_get_path(path).map_err(RequestParseError::InvalidRequest)?;
 
             let opt_peer_ip = if config.network.runs_behind_reverse_proxy {
                 let header_name = &config.network.reverse_proxy_ip_header_name;
@@ -143,5 +151,16 @@ mod tests {
             res,
             Err(RequestParseError::RequiredPeerIpHeaderMissing(_))
         ));
+    }
+
+    #[test]
+    fn test_parse_invalid_complete_request() {
+        let config = Config::default();
+        let res = parse_request(
+            &config,
+            b"GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+
+        assert!(matches!(res, Err(RequestParseError::InvalidRequest(_))));
     }
 }
