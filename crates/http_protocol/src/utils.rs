@@ -19,6 +19,48 @@ pub fn urlencode_20_bytes(input: [u8; 20], output: &mut impl Write) -> ::std::io
 }
 
 pub fn urldecode_20_bytes(value: &str) -> anyhow::Result<[u8; 20]> {
+    if value.is_ascii() {
+        return urldecode_20_ascii_bytes(value.as_bytes());
+    }
+
+    urldecode_20_bytes_slow(value)
+}
+
+fn urldecode_20_ascii_bytes(value: &[u8]) -> anyhow::Result<[u8; 20]> {
+    let mut out_arr = [0u8; 20];
+    let mut value_index = 0;
+
+    for output in &mut out_arr {
+        let byte = *value
+            .get(value_index)
+            .with_context(|| "less than 20 chars")?;
+
+        if byte == b'%' {
+            let first = *value
+                .get(value_index + 1)
+                .with_context(|| "missing first urldecode char in pair")?;
+            let second = *value
+                .get(value_index + 2)
+                .with_context(|| "missing second urldecode char in pair")?;
+
+            *output = decode_hex_byte(first, second)?;
+
+            value_index += 3;
+        } else {
+            *output = byte;
+
+            value_index += 1;
+        }
+    }
+
+    if value_index != value.len() {
+        return Err(anyhow::anyhow!("more than 20 chars"));
+    }
+
+    Ok(out_arr)
+}
+
+fn urldecode_20_bytes_slow(value: &str) -> anyhow::Result<[u8; 20]> {
     let mut out_arr = [0u8; 20];
 
     let mut chars = value.chars();
@@ -55,6 +97,24 @@ pub fn urldecode_20_bytes(value: &str) -> anyhow::Result<[u8; 20]> {
     }
 
     Ok(out_arr)
+}
+
+#[inline]
+fn decode_hex_byte(first: u8, second: u8) -> anyhow::Result<u8> {
+    let first = decode_hex_nibble(first).ok_or(anyhow::anyhow!("hex decode error"))?;
+    let second = decode_hex_nibble(second).ok_or(anyhow::anyhow!("hex decode error"))?;
+
+    Ok((first << 4) | second)
+}
+
+#[inline]
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -305,6 +365,13 @@ mod tests {
         assert_eq!(input, decoded);
 
         input == decoded
+    }
+
+    #[test]
+    fn test_urldecode_20_bytes_mixed_ascii_and_escaped_bytes() {
+        let decoded = urldecode_20_bytes("-ABC940-5ert69%00w5t8x").unwrap();
+
+        assert_eq!(decoded, *b"-ABC940-5ert69\0w5t8x");
     }
 
     #[quickcheck]

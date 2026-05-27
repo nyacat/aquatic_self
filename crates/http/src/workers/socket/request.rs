@@ -60,25 +60,18 @@ fn parse_forwarded_header(
     header_format: ReverseProxyPeerIpHeaderFormat,
     headers: &[httparse::Header<'_>],
 ) -> anyhow::Result<IpAddr> {
+    if let Some(header_name) = configured_single_header_name(header_names) {
+        return parse_named_forwarded_header(header_name, header_format, headers)?
+            .ok_or(anyhow::anyhow!("header not present"));
+    }
+
     let mut saw_configured_header_name = false;
 
     for header_name in configured_header_names(header_names) {
         saw_configured_header_name = true;
 
-        for header in headers.iter().rev() {
-            if header.name.eq_ignore_ascii_case(header_name) {
-                match header_format {
-                    ReverseProxyPeerIpHeaderFormat::LastAddress => {
-                        return ::std::str::from_utf8(header.value)?
-                            .split(',')
-                            .next_back()
-                            .ok_or(anyhow::anyhow!("no header value"))?
-                            .trim()
-                            .parse::<IpAddr>()
-                            .with_context(|| format!("parse {} header IP", header_name));
-                    }
-                }
-            }
+        if let Some(peer_ip) = parse_named_forwarded_header(header_name, header_format, headers)? {
+            return Ok(peer_ip);
         }
     }
 
@@ -86,6 +79,47 @@ fn parse_forwarded_header(
         Err(anyhow::anyhow!("header not present"))
     } else {
         Err(anyhow::anyhow!("no header name configured"))
+    }
+}
+
+fn parse_named_forwarded_header(
+    header_name: &str,
+    header_format: ReverseProxyPeerIpHeaderFormat,
+    headers: &[httparse::Header<'_>],
+) -> anyhow::Result<Option<IpAddr>> {
+    for header in headers.iter().rev() {
+        if header.name.eq_ignore_ascii_case(header_name) {
+            return parse_forwarded_header_value(header_name, header_format, header.value)
+                .map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_forwarded_header_value(
+    header_name: &str,
+    header_format: ReverseProxyPeerIpHeaderFormat,
+    value: &[u8],
+) -> anyhow::Result<IpAddr> {
+    match header_format {
+        ReverseProxyPeerIpHeaderFormat::LastAddress => ::std::str::from_utf8(value)?
+            .rsplit(',')
+            .next()
+            .ok_or(anyhow::anyhow!("no header value"))?
+            .trim()
+            .parse::<IpAddr>()
+            .with_context(|| format!("parse {} header IP", header_name)),
+    }
+}
+
+fn configured_single_header_name(header_names: &str) -> Option<&str> {
+    let header_name = header_names.trim();
+
+    if header_name.is_empty() || header_name.as_bytes().contains(&b',') {
+        None
+    } else {
+        Some(header_name)
     }
 }
 
@@ -174,6 +208,28 @@ mod tests {
                 .unwrap(),
             expected_ip
         )
+    }
+
+    #[test]
+    fn test_parse_peer_ip_header_does_not_fallback_after_invalid_present_header() {
+        let mut config = Config::default();
+
+        config.network.runs_behind_reverse_proxy = true;
+        config.network.reverse_proxy_ip_header_name = "X-Forwarded-For, CF-Connecting-IP".into();
+        config.network.reverse_proxy_ip_header_format = ReverseProxyPeerIpHeaderFormat::LastAddress;
+
+        let mut request = REQUEST_START.to_string();
+
+        request.push_str("X-Forwarded-For: not-an-ip\r\n");
+        request.push_str("CF-Connecting-IP: 203.0.113.7\r\n");
+        request.push_str("\r\n");
+
+        let res = parse_request(&config, request.as_bytes());
+
+        assert!(matches!(
+            res,
+            Err(RequestParseError::RequiredPeerIpHeaderMissing(_))
+        ));
     }
 
     #[test]

@@ -274,11 +274,7 @@ where
 
                 let info_hash = request.info_hash;
 
-                if self
-                    .access_list_cache
-                    .load()
-                    .allows(self.config.access_list.mode, &info_hash.0)
-                {
+                if self.info_hash_allowed(&info_hash) {
                     let (response_sender, response_receiver) = shared_channel::new_bounded(1);
 
                     let request = ChannelRequest::Announce {
@@ -362,6 +358,19 @@ where
         }
     }
 
+    #[inline]
+    fn info_hash_allowed(&mut self, info_hash: &InfoHash) -> bool {
+        let access_list_mode = self.config.access_list.mode;
+
+        if access_list_mode.is_on() {
+            self.access_list_cache
+                .load()
+                .allows(access_list_mode, &info_hash.0)
+        } else {
+            true
+        }
+    }
+
     /// Wait for partial scrape responses to arrive,
     /// return full response
     async fn wait_for_scrape_responses(
@@ -405,11 +414,12 @@ where
     ) -> Result<(), ConnectionError> {
         let position = write_response_to_buffer(&mut self.response_buffer, response)?;
 
-        self.stream
-            .write(&self.response_buffer[..position])
-            .await
-            .with_context(|| "write")?;
-        self.stream.flush().await.with_context(|| "flush")?;
+        write_response_bytes_to_stream(
+            &mut self.stream,
+            &self.response_buffer[..position],
+            self.config.network.enable_tls,
+        )
+        .await?;
 
         #[cfg(feature = "metrics")]
         {
@@ -434,6 +444,23 @@ where
 
         Ok(())
     }
+}
+
+async fn write_response_bytes_to_stream<S>(
+    stream: &mut S,
+    bytes: &[u8],
+    flush_after_write: bool,
+) -> Result<(), ConnectionError>
+where
+    S: futures::AsyncWrite + Unpin,
+{
+    stream.write_all(bytes).await.with_context(|| "write all")?;
+
+    if flush_after_write {
+        stream.flush().await.with_context(|| "flush")?;
+    }
+
+    Ok(())
 }
 
 fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usize {
@@ -494,6 +521,10 @@ fn request_read_error_response(err: ConnectionError) -> Result<Response, Connect
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use aquatic_http_protocol::{
         common::InfoHash,
         request::{Request, ScrapeRequest},
@@ -504,9 +535,46 @@ mod tests {
 
     use super::{
         request_parse_error_response, request_read_error_response,
-        required_peer_ip_header_missing_error, write_response_to_buffer, ConnectionError,
-        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
+        required_peer_ip_header_missing_error, write_response_bytes_to_stream,
+        write_response_to_buffer, ConnectionError, REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE,
+        RESPONSE_HEADER_A,
     };
+
+    struct PartialWriteSink {
+        max_write_len: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl PartialWriteSink {
+        fn new(max_write_len: usize) -> Self {
+            Self {
+                max_write_len,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl futures::AsyncWrite for PartialWriteSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let write_len = buf.len().min(self.max_write_len);
+
+            self.bytes.extend_from_slice(&buf[..write_len]);
+
+            Poll::Ready(Ok(write_len))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn default_request_buffer_fits_configured_max_scrape_request() {
@@ -642,5 +710,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(content_len, response_buffer.len() - header_end - 4);
+    }
+
+    #[test]
+    fn write_response_bytes_to_stream_completes_partial_writes() {
+        let mut sink = PartialWriteSink::new(3);
+        let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nd4:oke\r\n";
+
+        futures_lite::future::block_on(write_response_bytes_to_stream(&mut sink, bytes, false))
+            .unwrap();
+
+        assert_eq!(sink.bytes, bytes);
     }
 }
