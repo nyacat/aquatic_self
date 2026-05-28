@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures_lite::{Stream, StreamExt};
-use glommio::channels::channel_mesh::{MeshBuilder, Partial, Role};
+use glommio::channels::channel_mesh::{MeshBuilder, Partial, Role, Senders};
 use glommio::timer::TimerActionRepeat;
 use glommio::{enclose, prelude::*};
 use rand::{make_rng, rngs::SmallRng};
@@ -21,6 +21,7 @@ pub async fn run_swarm_worker(
     config: Config,
     state: State,
     request_mesh_builder: MeshBuilder<ChannelRequest, Partial>,
+    response_mesh_builder: MeshBuilder<ChannelResponse, Partial>,
     server_start_instant: ServerStartInstant,
     worker_index: usize,
 ) -> anyhow::Result<()> {
@@ -28,6 +29,11 @@ pub async fn run_swarm_worker(
         .join(Role::Consumer)
         .await
         .map_err(|err| anyhow::anyhow!("join request mesh: {:#}", err))?;
+    let (response_senders, _) = response_mesh_builder
+        .join(Role::Producer)
+        .await
+        .map_err(|err| anyhow::anyhow!("join response mesh: {:#}", err))?;
+    let response_senders = Rc::new(response_senders);
 
     let torrents = Rc::new(RefCell::new(TorrentMaps::new(worker_index)));
     let access_list = state.access_list;
@@ -77,6 +83,7 @@ pub async fn run_swarm_worker(
             config.clone(),
             torrents.clone(),
             peer_valid_until.clone(),
+            response_senders.clone(),
             receiver,
         ))
         .detach();
@@ -95,6 +102,7 @@ async fn handle_request_stream<S>(
     config: Config,
     torrents: Rc<RefCell<TorrentMaps>>,
     peer_valid_until: Rc<RefCell<ValidUntil>>,
+    response_senders: Rc<Senders<ChannelResponse>>,
     mut stream: S,
 ) where
     S: Stream<Item = ChannelRequest> + ::std::marker::Unpin,
@@ -104,9 +112,10 @@ async fn handle_request_stream<S>(
     while let Some(channel_request) = stream.next().await {
         match channel_request {
             ChannelRequest::Announce {
+                request_id,
+                socket_worker_index,
                 request,
                 peer_addr,
-                response_sender,
             } => {
                 let response = torrents.borrow_mut().handle_announce_request(
                     &config,
@@ -116,20 +125,39 @@ async fn handle_request_stream<S>(
                     request,
                 );
 
-                if let Err(err) = response_sender.connect().await.send(response).await {
+                if let Err(err) = response_senders
+                    .send_to(
+                        socket_worker_index,
+                        ChannelResponse::Announce {
+                            request_id,
+                            response,
+                        },
+                    )
+                    .await
+                {
                     ::log::error!("swarm worker could not send announce response: {:#}", err);
                 }
             }
             ChannelRequest::Scrape {
+                request_id,
+                socket_worker_index,
                 request,
                 peer_addr,
-                response_sender,
             } => {
                 let response = torrents
                     .borrow_mut()
                     .handle_scrape_request(&config, peer_addr, request);
 
-                if let Err(err) = response_sender.connect().await.send(response).await {
+                if let Err(err) = response_senders
+                    .send_to(
+                        socket_worker_index,
+                        ChannelResponse::Scrape {
+                            request_id,
+                            response,
+                        },
+                    )
+                    .await
+                {
                     ::log::error!("swarm worker could not send scrape response: {:#}", err);
                 }
             }

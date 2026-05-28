@@ -107,6 +107,10 @@ pub struct NetworkConfig {
     pub tls_private_key_path: PathBuf,
     /// Keep connections alive after sending a response
     pub keep_alive: bool,
+    /// Maximum milliseconds to wait for one complete HTTP request header
+    pub request_read_timeout_ms: u64,
+    /// Maximum milliseconds to wait for an internal swarm worker response
+    pub internal_response_timeout_ms: u64,
     /// Does tracker run behind reverse proxy?
     ///
     /// MUST be set to false if not running behind reverse proxy.
@@ -150,6 +154,8 @@ impl Default for NetworkConfig {
             tls_private_key_path: "".into(),
             tcp_backlog: 1024,
             keep_alive: true,
+            request_read_timeout_ms: 10_000,
+            internal_response_timeout_ms: 10_000,
             runs_behind_reverse_proxy: false,
             reverse_proxy_ip_header_name: "X-Forwarded-For".into(),
             reverse_proxy_ip_header_format: Default::default(),

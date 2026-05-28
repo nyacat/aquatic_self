@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use aquatic_common::access_list::{create_access_list_cache, AccessListArcSwap, AccessListCache};
@@ -14,12 +15,11 @@ use aquatic_http_protocol::response::{
     FailureResponse, Response, ScrapeResponse, ScrapeStatistics,
 };
 use arc_swap::ArcSwap;
-use futures::stream::FuturesUnordered;
-use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
+use futures_lite::future::race;
+use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use futures_rustls::TlsAcceptor;
-use glommio::channels::channel_mesh::Senders;
-use glommio::channels::shared_channel::{self, SharedReceiver};
 use glommio::net::TcpStream;
+use glommio::timer::Timer;
 use once_cell::sync::Lazy;
 
 use crate::common::*;
@@ -28,6 +28,7 @@ use crate::config::Config;
 #[cfg(feature = "metrics")]
 use super::peer_addr_to_ip_version_str;
 use super::request::{parse_request, RequestParseError};
+use super::{PendingResponseGuard, SocketWorkerState};
 
 const REQUEST_BUFFER_SIZE: usize = 16 * 1024;
 const RESPONSE_BUFFER_SIZE: usize = 4096;
@@ -60,10 +61,14 @@ pub enum ConnectionError {
     ResponseBufferWrite(::std::io::Error),
     #[error("peer closed")]
     PeerClosed,
-    #[error("response sender closed")]
-    ResponseSenderClosed,
-    #[error("scrape channel error: {0}")]
-    ScrapeChannelError(&'static str),
+    #[error("response receiver closed")]
+    ResponseReceiverClosed,
+    #[error("internal response timeout")]
+    InternalResponseTimeout,
+    #[error("request read timeout")]
+    RequestReadTimeout,
+    #[error("unexpected internal response")]
+    UnexpectedInternalResponse,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -72,12 +77,11 @@ pub enum ConnectionError {
 pub(super) async fn run_connection(
     config: Rc<Config>,
     access_list: Arc<AccessListArcSwap>,
-    request_senders: Rc<Senders<ChannelRequest>>,
+    socket_worker_state: SocketWorkerState,
     server_start_instant: ServerStartInstant,
     opt_tls_config: Option<Arc<ArcSwap<RustlsConfig>>>,
     valid_until: Rc<RefCell<ValidUntil>>,
     stream: TcpStream,
-    worker_index: usize,
 ) -> Result<(), ConnectionError> {
     let access_list_cache = create_access_list_cache(&access_list);
     let request_buffer = Box::new([0u8; REQUEST_BUFFER_SIZE]);
@@ -95,6 +99,7 @@ pub(super) async fn run_connection(
     };
 
     let peer_port = remote_addr.port();
+    let worker_index_string = socket_worker_state.worker_index().to_string();
 
     if let Some(tls_config) = opt_tls_config {
         let tls_acceptor: TlsAcceptor = tls_config.load_full().into();
@@ -106,7 +111,7 @@ pub(super) async fn run_connection(
         let mut conn = Connection {
             config,
             access_list_cache,
-            request_senders,
+            socket_worker_state,
             valid_until,
             server_start_instant,
             peer_port,
@@ -114,7 +119,7 @@ pub(super) async fn run_connection(
             request_buffer_position: 0,
             response_buffer,
             stream,
-            worker_index_string: worker_index.to_string(),
+            worker_index_string,
         };
 
         conn.run(opt_peer_addr).await
@@ -122,7 +127,7 @@ pub(super) async fn run_connection(
         let mut conn = Connection {
             config,
             access_list_cache,
-            request_senders,
+            socket_worker_state,
             valid_until,
             server_start_instant,
             peer_port,
@@ -130,7 +135,7 @@ pub(super) async fn run_connection(
             request_buffer_position: 0,
             response_buffer,
             stream,
-            worker_index_string: worker_index.to_string(),
+            worker_index_string,
         };
 
         conn.run(opt_peer_addr).await
@@ -140,7 +145,7 @@ pub(super) async fn run_connection(
 struct Connection<S> {
     config: Rc<Config>,
     access_list_cache: AccessListCache,
-    request_senders: Rc<Senders<ChannelRequest>>,
+    socket_worker_state: SocketWorkerState,
     valid_until: Rc<RefCell<ValidUntil>>,
     server_start_instant: ServerStartInstant,
     peer_port: u16,
@@ -161,17 +166,19 @@ where
         opt_stable_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
         loop {
-            let (request, opt_peer_addr) = match self.read_request().await {
-                Ok(request) => request,
-                Err(err) => match request_read_error_response(err) {
-                    Ok(response) => {
-                        self.write_response(&response, None).await?;
+            let read_timeout_ms = self.config.network.request_read_timeout_ms;
+            let (request, opt_peer_addr) =
+                match request_read_timeout(read_timeout_ms, self.read_request()).await {
+                    Ok(request) => request,
+                    Err(err) => match request_read_error_response(err) {
+                        Ok(response) => {
+                            self.write_response(&response, None).await?;
 
-                        break;
-                    }
-                    Err(err) => return Err(err),
-                },
-            };
+                            break;
+                        }
+                        Err(err) => return Err(err),
+                    },
+                };
 
             let peer_addr = opt_stable_peer_addr
                 .or(opt_peer_addr)
@@ -275,29 +282,39 @@ where
                 let info_hash = request.info_hash;
 
                 if self.info_hash_allowed(&info_hash) {
-                    let (response_sender, response_receiver) = shared_channel::new_bounded(1);
+                    let pending_response = self.socket_worker_state.register_pending_response();
+                    let request_id = pending_response.request_id();
 
                     let request = ChannelRequest::Announce {
+                        request_id,
+                        socket_worker_index: self.socket_worker_state.worker_index(),
                         request,
                         peer_addr,
-                        response_sender,
                     };
 
                     let consumer_index = calculate_request_consumer_index(&self.config, info_hash);
 
-                    // Only fails when receiver is closed
-                    self.request_senders
+                    if self
+                        .socket_worker_state
+                        .request_senders()
                         .send_to(consumer_index, request)
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        pending_response.unregister();
+                        return Ok(internal_error_response());
+                    }
 
-                    response_receiver
-                        .connect()
-                        .await
-                        .recv()
-                        .await
-                        .ok_or(ConnectionError::ResponseSenderClosed)
-                        .map(Response::Announce)
+                    match self.wait_for_announce_response(&pending_response).await {
+                        Ok(response) => Ok(Response::Announce(response)),
+                        Err(ConnectionError::InternalResponseTimeout) => {
+                            Ok(internal_error_response())
+                        }
+                        Err(ConnectionError::ResponseReceiverClosed) => {
+                            Ok(internal_error_response())
+                        }
+                        Err(err) => Err(err),
+                    }
                 } else {
                     let response = Response::Failure(FailureResponse {
                         failure_reason: "Info hash not allowed".into(),
@@ -327,24 +344,27 @@ where
                 }
 
                 let pending_worker_responses = info_hashes_by_worker.len();
-                let mut response_receivers = Vec::with_capacity(pending_worker_responses);
+                let pending_response = self.socket_worker_state.register_pending_response();
+                let request_id = pending_response.request_id();
 
                 for (consumer_index, info_hashes) in info_hashes_by_worker {
-                    let (response_sender, response_receiver) = shared_channel::new_bounded(1);
-
-                    response_receivers.push(response_receiver);
-
                     let request = ChannelRequest::Scrape {
+                        request_id,
+                        socket_worker_index: self.socket_worker_state.worker_index(),
                         request: ScrapeRequest { info_hashes },
                         peer_addr,
-                        response_sender,
                     };
 
-                    // Only fails when receiver is closed
-                    self.request_senders
+                    if self
+                        .socket_worker_state
+                        .request_senders()
                         .send_to(consumer_index, request)
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        pending_response.unregister();
+                        return Ok(internal_error_response());
+                    }
                 }
 
                 let pending_scrape_response = PendingScrapeResponse {
@@ -352,8 +372,15 @@ where
                     stats: Default::default(),
                 };
 
-                self.wait_for_scrape_responses(response_receivers, pending_scrape_response)
+                match self
+                    .wait_for_scrape_responses(&pending_response, pending_scrape_response)
                     .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(ConnectionError::InternalResponseTimeout) => Ok(internal_error_response()),
+                    Err(ConnectionError::ResponseReceiverClosed) => Ok(internal_error_response()),
+                    Err(err) => Err(err),
+                }
             }
         }
     }
@@ -371,30 +398,47 @@ where
         }
     }
 
+    async fn wait_for_announce_response(
+        &self,
+        pending_response: &PendingResponseGuard,
+    ) -> Result<aquatic_http_protocol::response::AnnounceResponse, ConnectionError> {
+        let response = response_recv_timeout(
+            self.config.network.internal_response_timeout_ms,
+            pending_response.recv(),
+        )
+        .await?
+        .ok_or(ConnectionError::ResponseReceiverClosed)?;
+
+        match response {
+            ChannelResponse::Announce { response, .. } => Ok(response),
+            ChannelResponse::Scrape { .. } => Err(ConnectionError::UnexpectedInternalResponse),
+        }
+    }
+
     /// Wait for partial scrape responses to arrive,
     /// return full response
     async fn wait_for_scrape_responses(
         &self,
-        response_receivers: Vec<SharedReceiver<ScrapeResponse>>,
+        pending_response: &PendingResponseGuard,
         mut pending: PendingScrapeResponse,
     ) -> Result<Response, ConnectionError> {
-        let mut responses = response_receivers
-            .into_iter()
-            .map(|receiver| async { receiver.connect().await.recv().await })
-            .collect::<FuturesUnordered<_>>();
-
         loop {
-            let response = responses
-                .next()
-                .await
-                .ok_or_else(|| {
-                    ConnectionError::ScrapeChannelError(
-                        "stream ended before all partial scrape responses received",
-                    )
-                })?
-                .ok_or_else(|| ConnectionError::ScrapeChannelError("sender is closed"))?;
+            let response = response_recv_timeout(
+                self.config.network.internal_response_timeout_ms,
+                pending_response.recv(),
+            )
+            .await?
+            .ok_or(ConnectionError::ResponseReceiverClosed)?;
 
-            pending.stats.extend(response.files);
+            match response {
+                ChannelResponse::Scrape { response, .. } => {
+                    pending.stats.extend(response.files);
+                }
+                ChannelResponse::Announce { .. } => {
+                    return Err(ConnectionError::UnexpectedInternalResponse);
+                }
+            }
+
             pending.pending_worker_responses -= 1;
 
             if pending.pending_worker_responses == 0 {
@@ -442,8 +486,40 @@ where
             }
         }
 
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = opt_peer_addr;
+        }
+
         Ok(())
     }
+}
+
+async fn request_read_timeout<T, F>(duration_ms: u64, future: F) -> Result<T, ConnectionError>
+where
+    F: std::future::Future<Output = Result<T, ConnectionError>>,
+{
+    race(future, async move {
+        Timer::new(Duration::from_millis(duration_ms)).await;
+
+        Err(ConnectionError::RequestReadTimeout)
+    })
+    .await
+}
+
+async fn response_recv_timeout<F>(
+    duration_ms: u64,
+    future: F,
+) -> Result<Option<ChannelResponse>, ConnectionError>
+where
+    F: std::future::Future<Output = Option<ChannelResponse>>,
+{
+    race(async move { Ok(future.await) }, async move {
+        Timer::new(Duration::from_millis(duration_ms)).await;
+
+        Err(ConnectionError::InternalResponseTimeout)
+    })
+    .await
 }
 
 async fn write_response_bytes_to_stream<S>(
@@ -509,11 +585,18 @@ fn request_parse_error_response(err: anyhow::Error) -> Response {
     Response::Failure(FailureResponse::new(format!("Invalid request: {:#}", err)))
 }
 
+fn internal_error_response() -> Response {
+    Response::Failure(FailureResponse::new("Tracker temporarily unavailable"))
+}
+
 fn request_read_error_response(err: ConnectionError) -> Result<Response, ConnectionError> {
     match err {
         ConnectionError::RequestParse(err) => Ok(request_parse_error_response(err)),
         ConnectionError::RequestBufferFull => Ok(Response::Failure(FailureResponse::new(
             "Request too large: HTTP request headers exceed the request buffer",
+        ))),
+        ConnectionError::RequestReadTimeout => Ok(Response::Failure(FailureResponse::new(
+            "Request timeout: HTTP request headers were not received in time",
         ))),
         err => Err(err),
     }
@@ -534,10 +617,10 @@ mod tests {
     use crate::config::Config;
 
     use super::{
-        request_parse_error_response, request_read_error_response,
-        required_peer_ip_header_missing_error, write_response_bytes_to_stream,
-        write_response_to_buffer, ConnectionError, REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE,
-        RESPONSE_HEADER_A,
+        internal_error_response, request_parse_error_response, request_read_error_response,
+        request_read_timeout, required_peer_ip_header_missing_error, response_recv_timeout,
+        write_response_bytes_to_stream, write_response_to_buffer, ConnectionError,
+        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
     };
 
     struct PartialWriteSink {
@@ -666,6 +749,53 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\nContent-Length: "));
         assert!(response.contains("d14:failure reason"));
         assert!(response.contains("Request too large"));
+    }
+
+    #[test]
+    fn test_request_read_timeout_is_written_as_failure_response() {
+        let response = request_read_error_response(ConnectionError::RequestReadTimeout).unwrap();
+
+        match response {
+            Response::Failure(response) => assert_eq!(
+                response.failure_reason,
+                "Request timeout: HTTP request headers were not received in time",
+            ),
+            _ => panic!("expected failure response"),
+        }
+    }
+
+    #[test]
+    fn test_internal_error_response_is_tracker_failure() {
+        match internal_error_response() {
+            Response::Failure(response) => {
+                assert_eq!(response.failure_reason, "Tracker temporarily unavailable")
+            }
+            _ => panic!("expected failure response"),
+        }
+    }
+
+    #[test]
+    fn request_read_timeout_returns_inner_result_before_timer() {
+        let result = glommio::LocalExecutorBuilder::default()
+            .make()
+            .unwrap()
+            .run(request_read_timeout(10_000, async {
+                Ok::<_, ConnectionError>("ok")
+            }))
+            .unwrap();
+
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn response_recv_timeout_returns_inner_result_before_timer() {
+        let result = glommio::LocalExecutorBuilder::default()
+            .make()
+            .unwrap()
+            .run(response_recv_timeout(10_000, async { None }))
+            .unwrap();
+
+        assert!(result.is_none());
     }
 
     #[test]

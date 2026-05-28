@@ -2,6 +2,7 @@ mod connection;
 mod request;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::prelude::{FromRawFd, IntoRawFd};
 use std::rc::Rc;
@@ -12,12 +13,14 @@ use anyhow::Context;
 use aquatic_common::access_list::AccessList;
 use aquatic_common::privileges::PrivilegeDropper;
 use aquatic_common::rustls_config::RustlsConfig;
-use aquatic_common::{CanonicalSocketAddr, ServerStartInstant};
+#[cfg(feature = "metrics")]
+use aquatic_common::CanonicalSocketAddr;
+use aquatic_common::ServerStartInstant;
 use arc_swap::{ArcSwap, ArcSwapAny};
 use futures_lite::future::race;
 use futures_lite::StreamExt;
-use glommio::channels::channel_mesh::{MeshBuilder, Partial, Role, Senders};
-use glommio::channels::local_channel::{new_bounded, LocalReceiver, LocalSender};
+use glommio::channels::channel_mesh::{MeshBuilder, Partial, Receivers, Role, Senders};
+use glommio::channels::local_channel::{new_bounded, new_unbounded, LocalReceiver, LocalSender};
 use glommio::net::{TcpListener, TcpStream};
 use glommio::timer::TimerActionRepeat;
 use glommio::{enclose, prelude::*};
@@ -32,12 +35,103 @@ struct ConnectionHandle {
     valid_until: Rc<RefCell<ValidUntil>>,
 }
 
+type PendingResponses = Rc<RefCell<HashMap<RequestId, Rc<LocalSender<ChannelResponse>>>>>;
+
+#[derive(Clone)]
+pub(super) struct SocketWorkerState {
+    request_senders: Rc<Senders<ChannelRequest>>,
+    registry: PendingResponseRegistry,
+    worker_index: usize,
+}
+
+impl SocketWorkerState {
+    pub(super) fn register_pending_response(&self) -> PendingResponseGuard {
+        self.registry.register()
+    }
+
+    pub(super) fn request_senders(&self) -> &Senders<ChannelRequest> {
+        self.request_senders.as_ref()
+    }
+
+    pub(super) fn worker_index(&self) -> usize {
+        self.worker_index
+    }
+}
+
+#[derive(Clone)]
+struct PendingResponseRegistry {
+    senders: PendingResponses,
+    next_request_id: Rc<RefCell<u64>>,
+}
+
+impl PendingResponseRegistry {
+    fn new() -> Self {
+        Self {
+            senders: Rc::new(RefCell::new(HashMap::new())),
+            next_request_id: Rc::new(RefCell::new(0)),
+        }
+    }
+
+    fn register(&self) -> PendingResponseGuard {
+        let request_id = self.next_request_id();
+        let (sender, receiver) = new_unbounded();
+
+        self.senders
+            .borrow_mut()
+            .insert(request_id, Rc::new(sender));
+
+        PendingResponseGuard {
+            request_id,
+            receiver,
+            pending_responses: self.senders.clone(),
+        }
+    }
+
+    fn sender(&self, request_id: RequestId) -> Option<Rc<LocalSender<ChannelResponse>>> {
+        self.senders.borrow().get(&request_id).cloned()
+    }
+
+    fn next_request_id(&self) -> RequestId {
+        let mut next = self.next_request_id.borrow_mut();
+        let request_id = RequestId(*next);
+        *next = next.wrapping_add(1);
+        request_id
+    }
+}
+
+pub(super) struct PendingResponseGuard {
+    request_id: RequestId,
+    receiver: LocalReceiver<ChannelResponse>,
+    pending_responses: PendingResponses,
+}
+
+impl PendingResponseGuard {
+    pub(super) fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    pub(super) async fn recv(&self) -> Option<ChannelResponse> {
+        self.receiver.recv().await
+    }
+
+    pub(super) fn unregister(&self) {
+        self.pending_responses.borrow_mut().remove(&self.request_id);
+    }
+}
+
+impl Drop for PendingResponseGuard {
+    fn drop(&mut self) {
+        self.pending_responses.borrow_mut().remove(&self.request_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_socket_worker(
     config: Config,
     state: State,
     opt_tls_config: Option<Arc<ArcSwap<RustlsConfig>>>,
     request_mesh_builder: MeshBuilder<ChannelRequest, Partial>,
+    response_mesh_builder: MeshBuilder<ChannelResponse, Partial>,
     mut priv_droppers: Vec<PrivilegeDropper>,
     server_start_instant: ServerStartInstant,
     worker_index: usize,
@@ -81,6 +175,18 @@ pub async fn run_socket_worker(
         .await
         .map_err(|err| anyhow::anyhow!("join request mesh: {:#}", err))?;
     let request_senders = Rc::new(request_senders);
+    let (_, response_receivers) = response_mesh_builder
+        .join(Role::Consumer)
+        .await
+        .map_err(|err| anyhow::anyhow!("join response mesh: {:#}", err))?;
+
+    let registry = PendingResponseRegistry::new();
+    let response_pumps = spawn_response_pumps(registry.clone(), response_receivers);
+    let socket_worker_state = SocketWorkerState {
+        request_senders,
+        registry,
+        worker_index,
+    };
 
     let connection_handles = Rc::new(RefCell::new(DenseSlotMap::with_key()));
 
@@ -101,8 +207,7 @@ pub async fn run_socket_worker(
                 opt_tls_config: opt_tls_config.clone(),
                 server_start_instant,
                 connection_handles: connection_handles.clone(),
-                request_senders: request_senders.clone(),
-                worker_index,
+                socket_worker_state: socket_worker_state.clone(),
             };
 
             spawn_local(listener_state.accept_connections(tcp_listener))
@@ -113,7 +218,45 @@ pub async fn run_socket_worker(
         task.await;
     }
 
+    for task in response_pumps {
+        task.await;
+    }
+
     Ok(())
+}
+
+fn spawn_response_pumps(
+    registry: PendingResponseRegistry,
+    mut response_receivers: Receivers<ChannelResponse>,
+) -> Vec<glommio::task::JoinHandle<()>> {
+    response_receivers
+        .streams()
+        .into_iter()
+        .map(|(_, mut receiver)| {
+            let registry = registry.clone();
+
+            spawn_local(async move {
+                while let Some(response) = receiver.next().await {
+                    let request_id = match &response {
+                        ChannelResponse::Announce { request_id, .. }
+                        | ChannelResponse::Scrape { request_id, .. } => *request_id,
+                    };
+
+                    if let Some(sender) = registry.sender(request_id) {
+                        if sender.try_send(response).is_err() {
+                            ::log::debug!(
+                                "dropped response for closed pending request {:?}",
+                                request_id
+                            );
+                        }
+                    } else {
+                        ::log::debug!("dropped late response for request {:?}", request_id);
+                    }
+                }
+            })
+            .detach()
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -123,8 +266,7 @@ struct ListenerState {
     opt_tls_config: Option<Arc<ArcSwap<RustlsConfig>>>,
     server_start_instant: ServerStartInstant,
     connection_handles: Rc<RefCell<DenseSlotMap<ConnectionId, ConnectionHandle>>>,
-    request_senders: Rc<Senders<ChannelRequest>>,
-    worker_index: usize,
+    socket_worker_state: SocketWorkerState,
 }
 
 impl ListenerState {
@@ -187,7 +329,7 @@ impl ListenerState {
         #[cfg(feature = "metrics")]
         let active_connections_gauge = ::metrics::gauge!(
             "aquatic_active_connections",
-            "worker_index" => self.worker_index.to_string(),
+            "worker_index" => self.socket_worker_state.worker_index().to_string(),
         );
 
         #[cfg(feature = "metrics")]
@@ -197,12 +339,11 @@ impl ListenerState {
             run_connection(
                 self.config,
                 self.access_list,
-                self.request_senders,
+                self.socket_worker_state,
                 self.server_start_instant,
                 self.opt_tls_config,
                 valid_until.clone(),
                 stream,
-                self.worker_index,
             )
             .await
         };
@@ -222,12 +363,15 @@ impl ListenerState {
             Err(
                 err @ (ConnectionError::ResponseBufferWrite(_)
                 | ConnectionError::ResponseBufferFull
-                | ConnectionError::ScrapeChannelError(_)
-                | ConnectionError::ResponseSenderClosed),
+                | ConnectionError::ResponseReceiverClosed
+                | ConnectionError::InternalResponseTimeout
+                | ConnectionError::UnexpectedInternalResponse),
             ) => {
                 ::log::error!("connection closed: {:#}", err);
             }
-            Err(err @ ConnectionError::RequestBufferFull) => {
+            Err(
+                err @ (ConnectionError::RequestBufferFull | ConnectionError::RequestReadTimeout),
+            ) => {
                 ::log::info!("connection closed: {:#}", err);
             }
             Err(err) => {
@@ -236,6 +380,32 @@ impl ListenerState {
         }
 
         self.connection_handles.borrow_mut().remove(connection_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_response_guard_unregisters_on_drop() {
+        let registry = PendingResponseRegistry::new();
+        let guard = registry.register();
+        let request_id = guard.request_id();
+
+        assert!(registry.sender(request_id).is_some());
+
+        drop(guard);
+
+        assert!(registry.sender(request_id).is_none());
+    }
+
+    #[test]
+    fn request_ids_increment_per_socket_worker() {
+        let registry = PendingResponseRegistry::new();
+
+        assert_eq!(registry.next_request_id(), RequestId(0));
+        assert_eq!(registry.next_request_id(), RequestId(1));
     }
 }
 

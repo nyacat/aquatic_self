@@ -41,6 +41,10 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
         config.socket_workers + config.swarm_workers,
         SHARED_CHANNEL_SIZE,
     );
+    let response_mesh_builder = MeshBuilder::partial(
+        config.socket_workers + config.swarm_workers,
+        SHARED_CHANNEL_SIZE,
+    );
 
     let num_sockets_per_worker =
         if config.network.use_ipv4 { 1 } else { 0 } + if config.network.use_ipv6 { 1 } else { 0 };
@@ -68,6 +72,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
         let state = state.clone();
         let opt_tls_config = opt_tls_config.clone();
         let request_mesh_builder = request_mesh_builder.clone();
+        let response_mesh_builder = response_mesh_builder.clone();
 
         let mut priv_droppers = Vec::new();
 
@@ -86,6 +91,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
                         state,
                         opt_tls_config,
                         request_mesh_builder,
+                        response_mesh_builder,
                         priv_droppers,
                         server_start_instant,
                         i,
@@ -100,6 +106,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
         let config = config.clone();
         let state = state.clone();
         let request_mesh_builder = request_mesh_builder.clone();
+        let response_mesh_builder = response_mesh_builder.clone();
 
         let handle = Builder::new()
             .name(format!("swarm-{:02}", i + 1))
@@ -111,6 +118,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
                         config,
                         state,
                         request_mesh_builder,
+                        response_mesh_builder,
                         server_start_instant,
                         i,
                     ))

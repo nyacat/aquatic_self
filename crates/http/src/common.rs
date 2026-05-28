@@ -9,8 +9,10 @@ use aquatic_http_protocol::{
     request::{AnnounceRequest, ScrapeRequest},
     response::{AnnounceResponse, ScrapeResponse},
 };
-use glommio::channels::shared_channel::SharedSender;
 use slotmap::new_key_type;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct RequestId(pub u64);
 
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug)]
@@ -23,14 +25,28 @@ new_key_type! {
 #[derive(Debug)]
 pub enum ChannelRequest {
     Announce {
+        request_id: RequestId,
+        socket_worker_index: usize,
         request: AnnounceRequest,
         peer_addr: CanonicalSocketAddr,
-        response_sender: SharedSender<AnnounceResponse>,
     },
     Scrape {
+        request_id: RequestId,
+        socket_worker_index: usize,
         request: ScrapeRequest,
         peer_addr: CanonicalSocketAddr,
-        response_sender: SharedSender<ScrapeResponse>,
+    },
+}
+
+#[derive(Debug)]
+pub enum ChannelResponse {
+    Announce {
+        request_id: RequestId,
+        response: AnnounceResponse,
+    },
+    Scrape {
+        request_id: RequestId,
+        response: ScrapeResponse,
     },
 }
 
