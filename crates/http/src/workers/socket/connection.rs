@@ -27,7 +27,7 @@ use crate::config::Config;
 
 #[cfg(feature = "metrics")]
 use super::peer_addr_to_ip_version_str;
-use super::request::{parse_request, RequestParseError};
+use super::request::{parse_request, HttpRequest, RequestParseError};
 use super::{PendingResponseGuard, SocketWorkerState};
 
 const REQUEST_BUFFER_SIZE: usize = 16 * 1024;
@@ -36,9 +36,21 @@ const RESPONSE_BUFFER_SIZE: usize = 4096;
 const RESPONSE_HEADER_A: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: ";
 const RESPONSE_HEADER_B: &[u8] = b"        ";
 const RESPONSE_HEADER_C: &[u8] = b"\r\n\r\n";
+const STATIC_INDEX_HEADER_A: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
+const STATIC_INDEX_HEADER_B: &[u8] = b"        ";
+const STATIC_INDEX_HEADER_C: &[u8] = b"\r\n\r\n";
 
 static RESPONSE_HEADER: Lazy<Vec<u8>> =
     Lazy::new(|| [RESPONSE_HEADER_A, RESPONSE_HEADER_B, RESPONSE_HEADER_C].concat());
+static STATIC_INDEX_HEADER: Lazy<Vec<u8>> = Lazy::new(|| {
+    [
+        STATIC_INDEX_HEADER_A,
+        STATIC_INDEX_HEADER_B,
+        STATIC_INDEX_HEADER_C,
+    ]
+    .concat()
+});
 
 struct PendingScrapeResponse {
     pending_worker_responses: usize,
@@ -84,6 +96,7 @@ pub(super) async fn run_connection(
     stream: TcpStream,
 ) -> Result<(), ConnectionError> {
     let access_list_cache = create_access_list_cache(&access_list);
+    let static_index_cache = create_static_index_cache(&socket_worker_state.static_index);
     let request_buffer = Box::new([0u8; REQUEST_BUFFER_SIZE]);
 
     let response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
@@ -111,6 +124,7 @@ pub(super) async fn run_connection(
         let mut conn = Connection {
             config,
             access_list_cache,
+            static_index_cache,
             socket_worker_state,
             valid_until,
             server_start_instant,
@@ -127,6 +141,7 @@ pub(super) async fn run_connection(
         let mut conn = Connection {
             config,
             access_list_cache,
+            static_index_cache,
             socket_worker_state,
             valid_until,
             server_start_instant,
@@ -145,6 +160,7 @@ pub(super) async fn run_connection(
 struct Connection<S> {
     config: Rc<Config>,
     access_list_cache: AccessListCache,
+    static_index_cache: StaticIndexCache,
     socket_worker_state: SocketWorkerState,
     valid_until: Rc<RefCell<ValidUntil>>,
     server_start_instant: ServerStartInstant,
@@ -180,13 +196,20 @@ where
                     },
                 };
 
-            let peer_addr = opt_stable_peer_addr
-                .or(opt_peer_addr)
-                .ok_or(anyhow::anyhow!("Could not extract peer addr"))?;
+            match request {
+                HttpRequest::Tracker(request) => {
+                    let peer_addr = opt_stable_peer_addr
+                        .or(opt_peer_addr)
+                        .ok_or(anyhow::anyhow!("Could not extract peer addr"))?;
 
-            let response = self.handle_request(request, peer_addr).await?;
+                    let response = self.handle_request(request, peer_addr).await?;
 
-            self.write_response(&response, Some(peer_addr)).await?;
+                    self.write_response(&response, Some(peer_addr)).await?;
+                }
+                HttpRequest::StaticIndex => {
+                    self.write_static_index_response().await?;
+                }
+            }
 
             if !self.config.network.keep_alive {
                 break;
@@ -198,7 +221,7 @@ where
 
     async fn read_request(
         &mut self,
-    ) -> Result<(Request, Option<CanonicalSocketAddr>), ConnectionError> {
+    ) -> Result<(HttpRequest, Option<CanonicalSocketAddr>), ConnectionError> {
         self.request_buffer_position = 0;
 
         loop {
@@ -493,6 +516,19 @@ where
 
         Ok(())
     }
+
+    async fn write_static_index_response(&mut self) -> Result<(), ConnectionError> {
+        let static_index = self.static_index_cache.load();
+        let position =
+            write_static_index_response_to_buffer(&mut self.response_buffer, static_index.body())?;
+
+        write_response_bytes_to_stream(
+            &mut self.stream,
+            &self.response_buffer[..position],
+            self.config.network.enable_tls,
+        )
+        .await
+    }
 }
 
 async fn request_read_timeout<T, F>(duration_ms: u64, future: F) -> Result<T, ConnectionError>
@@ -577,6 +613,32 @@ fn write_response_to_buffer(
     Ok(response_buffer.len())
 }
 
+fn write_static_index_response_to_buffer(
+    response_buffer: &mut Vec<u8>,
+    body: &[u8],
+) -> Result<usize, ConnectionError> {
+    response_buffer.clear();
+    response_buffer.extend_from_slice(&STATIC_INDEX_HEADER);
+
+    {
+        let mut buf = ::itoa::Buffer::new();
+        let content_len_bytes = buf.format(body.len()).as_bytes();
+
+        let start = STATIC_INDEX_HEADER_A.len();
+        let end = start + content_len_bytes.len();
+
+        if end > STATIC_INDEX_HEADER_A.len() + STATIC_INDEX_HEADER_B.len() {
+            return Err(ConnectionError::ResponseBufferFull);
+        }
+
+        response_buffer[start..end].copy_from_slice(content_len_bytes);
+    }
+
+    response_buffer.extend_from_slice(body);
+
+    Ok(response_buffer.len())
+}
+
 fn required_peer_ip_header_missing_error(err: anyhow::Error) -> ConnectionError {
     ConnectionError::RequestParse(err.context("required peer ip header missing or invalid"))
 }
@@ -619,8 +681,9 @@ mod tests {
     use super::{
         internal_error_response, request_parse_error_response, request_read_error_response,
         request_read_timeout, required_peer_ip_header_missing_error, response_recv_timeout,
-        write_response_bytes_to_stream, write_response_to_buffer, ConnectionError,
-        REQUEST_BUFFER_SIZE, RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
+        write_response_bytes_to_stream, write_response_to_buffer,
+        write_static_index_response_to_buffer, ConnectionError, REQUEST_BUFFER_SIZE,
+        RESPONSE_BUFFER_SIZE, RESPONSE_HEADER_A,
     };
 
     struct PartialWriteSink {
@@ -840,6 +903,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(content_len, response_buffer.len() - header_end - 4);
+    }
+
+    #[test]
+    fn test_write_static_index_response_to_buffer() {
+        let body = b"<!doctype html><title>aquatic</title>";
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        let written = write_static_index_response_to_buffer(&mut response_buffer, body).unwrap();
+
+        assert_eq!(written, response_buffer.len());
+
+        let response = std::str::from_utf8(&response_buffer).unwrap();
+
+        let header_end = response.find("\r\n\r\n").unwrap();
+        let header = &response[..header_end];
+        let content_len = header
+            .strip_prefix(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ",
+            )
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+
+        assert!(header.starts_with(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "
+        ));
+        assert_eq!(content_len, body.len());
+        assert!(response.ends_with("<!doctype html><title>aquatic</title>"));
     }
 
     #[test]

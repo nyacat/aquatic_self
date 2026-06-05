@@ -41,6 +41,7 @@ type PendingResponses = Rc<RefCell<HashMap<RequestId, Rc<LocalSender<ChannelResp
 pub(super) struct SocketWorkerState {
     request_senders: Rc<Senders<ChannelRequest>>,
     registry: PendingResponseRegistry,
+    static_index: Arc<StaticIndexArcSwap>,
     worker_index: usize,
     response_consumer_id: ConsumerId,
 }
@@ -195,6 +196,7 @@ pub async fn run_socket_worker(
     let socket_worker_state = SocketWorkerState {
         request_senders,
         registry,
+        static_index: state.static_index.clone(),
         worker_index,
         response_consumer_id,
     };
@@ -441,6 +443,7 @@ mod tests {
             let state = SocketWorkerState {
                 request_senders: Rc::new(request_senders),
                 registry: PendingResponseRegistry::new(),
+                static_index: Arc::new(ArcSwap::from_pointee(StaticIndex::from_bytes(b""))),
                 worker_index,
                 response_consumer_id,
             };

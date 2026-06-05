@@ -4,7 +4,7 @@ use aquatic_common::{
     rustls_config::create_rustls_config, ServerStartInstant, WorkerType,
 };
 use arc_swap::ArcSwap;
-use common::State;
+use common::{update_static_index, State};
 use glommio::{channels::channel_mesh::MeshBuilder, prelude::*};
 use signal_hook::{consts::SIGUSR1, iterator::Signals};
 use std::{
@@ -35,6 +35,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
 
     let state = State::default();
 
+    update_static_index(&config.static_index, &state.static_index)?;
     update_access_list(&config.access_list, &state.access_list)?;
 
     let request_mesh_builder = MeshBuilder::partial(
@@ -154,6 +155,7 @@ pub fn run(config: Config) -> ::anyhow::Result<()> {
                 for signal in &mut signals {
                     match signal {
                         SIGUSR1 => {
+                            let _ = update_static_index(&config.static_index, &state.static_index);
                             let _ = update_access_list(&config.access_list, &state.access_list);
 
                             if let Some(tls_config) = opt_tls_config.as_ref() {

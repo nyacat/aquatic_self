@@ -15,10 +15,20 @@ pub enum RequestParseError {
     MoreDataNeeded,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HttpRequest {
+    Tracker(Request),
+    StaticIndex,
+}
+
 pub fn parse_request(
     config: &Config,
     buffer: &[u8],
-) -> Result<(Request, Option<IpAddr>), RequestParseError> {
+) -> Result<(HttpRequest, Option<IpAddr>), RequestParseError> {
+    if let Some(request) = parse_static_index_request(buffer) {
+        return request;
+    }
+
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut http_request = httparse::Request::new(&mut headers);
 
@@ -32,8 +42,14 @@ pub fn parse_request(
                 .path
                 .ok_or(anyhow::anyhow!("no http path"))
                 .map_err(RequestParseError::InvalidRequest)?;
-            let request =
-                Request::parse_http_get_path(path).map_err(RequestParseError::InvalidRequest)?;
+            let request = if path == "/" || path == "/index.html" {
+                HttpRequest::StaticIndex
+            } else {
+                HttpRequest::Tracker(
+                    Request::parse_http_get_path(path)
+                        .map_err(RequestParseError::InvalidRequest)?,
+                )
+            };
 
             let opt_peer_ip = if config.network.runs_behind_reverse_proxy {
                 let header_name = &config.network.reverse_proxy_ip_header_name;
@@ -52,6 +68,25 @@ pub fn parse_request(
             Ok((request, opt_peer_ip))
         }
         httparse::Status::Partial => Err(RequestParseError::MoreDataNeeded),
+    }
+}
+
+fn parse_static_index_request(
+    buffer: &[u8],
+) -> Option<Result<(HttpRequest, Option<IpAddr>), RequestParseError>> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut http_request = httparse::Request::new(&mut headers);
+
+    match http_request.parse(buffer) {
+        Ok(httparse::Status::Complete(_)) => match http_request.path {
+            Some("/") | Some("/index.html") => Some(Ok((HttpRequest::StaticIndex, None))),
+            _ => None,
+        },
+        Ok(httparse::Status::Partial) => Some(Err(RequestParseError::MoreDataNeeded)),
+        Err(httparse::Error::TooManyHeaders) => Some(Err(RequestParseError::InvalidRequest(
+            anyhow::anyhow!("httparse: too many headers"),
+        ))),
+        Err(_) => None,
     }
 }
 
@@ -283,5 +318,31 @@ mod tests {
         );
 
         assert!(matches!(res, Err(RequestParseError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn test_parse_static_index_request() {
+        let config = Config::default();
+
+        for path in ["/", "/index.html"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let (request, opt_peer_ip) = parse_request(&config, request.as_bytes()).unwrap();
+
+            assert_eq!(request, HttpRequest::StaticIndex);
+            assert!(opt_peer_ip.is_none());
+        }
+
+        let mut request = String::from("GET / HTTP/1.1\r\n");
+
+        for index in 0..32 {
+            request.push_str(&format!("X-Test-{index}: value\r\n"));
+        }
+
+        request.push_str("\r\n");
+
+        let (request, opt_peer_ip) = parse_request(&config, request.as_bytes()).unwrap();
+
+        assert_eq!(request, HttpRequest::StaticIndex);
+        assert!(opt_peer_ip.is_none());
     }
 }

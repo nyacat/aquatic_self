@@ -36,6 +36,13 @@ pub struct Config {
     pub protocol: ProtocolConfig,
     pub cleaning: CleaningConfig,
     pub privileges: PrivilegeConfig,
+    /// Static index.html configuration
+    ///
+    /// The file is read on start and when the program receives `SIGUSR1`. If
+    /// initial reading fails, the program exits. Later failures result in an
+    /// error-level log message, while successful updates result in an info-level
+    /// log message.
+    pub static_index: StaticIndexConfig,
     /// Access list configuration
     ///
     /// The file is read on start and when the program receives `SIGUSR1`. If
@@ -57,6 +64,7 @@ impl Default for Config {
             protocol: ProtocolConfig::default(),
             cleaning: CleaningConfig::default(),
             privileges: PrivilegeConfig::default(),
+            static_index: StaticIndexConfig::default(),
             access_list: AccessListConfig::default(),
             #[cfg(feature = "metrics")]
             metrics: Default::default(),
@@ -67,6 +75,23 @@ impl Default for Config {
 impl aquatic_common::cli::Config for Config {
     fn get_log_level(&self) -> Option<LogLevel> {
         Some(self.log_level)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, TomlConfig, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StaticIndexConfig {
+    /// Path to static index.html file.
+    ///
+    /// If using chroot mode, path must be relative to new root.
+    pub path: PathBuf,
+}
+
+impl Default for StaticIndexConfig {
+    fn default() -> Self {
+        Self {
+            path: "./index.html".into(),
+        }
     }
 }
 
