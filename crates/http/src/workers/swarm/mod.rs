@@ -113,7 +113,7 @@ async fn handle_request_stream<S>(
         match channel_request {
             ChannelRequest::Announce {
                 request_id,
-                socket_worker_index,
+                response_consumer_id,
                 request,
                 peer_addr,
             } => {
@@ -127,7 +127,7 @@ async fn handle_request_stream<S>(
 
                 if let Err(err) = response_senders
                     .send_to(
-                        socket_worker_index,
+                        response_consumer_id.0,
                         ChannelResponse::Announce {
                             request_id,
                             response,
@@ -140,7 +140,7 @@ async fn handle_request_stream<S>(
             }
             ChannelRequest::Scrape {
                 request_id,
-                socket_worker_index,
+                response_consumer_id,
                 request,
                 peer_addr,
             } => {
@@ -150,7 +150,7 @@ async fn handle_request_stream<S>(
 
                 if let Err(err) = response_senders
                     .send_to(
-                        socket_worker_index,
+                        response_consumer_id.0,
                         ChannelResponse::Scrape {
                             request_id,
                             response,

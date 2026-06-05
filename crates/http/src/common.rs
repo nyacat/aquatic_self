@@ -14,8 +14,7 @@ use slotmap::new_key_type;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RequestId(pub u64);
 
-#[allow(dead_code)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ConsumerId(pub usize);
 
 new_key_type! {
@@ -26,13 +25,13 @@ new_key_type! {
 pub enum ChannelRequest {
     Announce {
         request_id: RequestId,
-        socket_worker_index: usize,
+        response_consumer_id: ConsumerId,
         request: AnnounceRequest,
         peer_addr: CanonicalSocketAddr,
     },
     Scrape {
         request_id: RequestId,
-        socket_worker_index: usize,
+        response_consumer_id: ConsumerId,
         request: ScrapeRequest,
         peer_addr: CanonicalSocketAddr,
     },

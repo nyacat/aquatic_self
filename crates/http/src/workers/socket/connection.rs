@@ -287,7 +287,7 @@ where
 
                     let request = ChannelRequest::Announce {
                         request_id,
-                        socket_worker_index: self.socket_worker_state.worker_index(),
+                        response_consumer_id: self.socket_worker_state.response_consumer_id(),
                         request,
                         peer_addr,
                     };
@@ -350,7 +350,7 @@ where
                 for (consumer_index, info_hashes) in info_hashes_by_worker {
                     let request = ChannelRequest::Scrape {
                         request_id,
-                        socket_worker_index: self.socket_worker_state.worker_index(),
+                        response_consumer_id: self.socket_worker_state.response_consumer_id(),
                         request: ScrapeRequest { info_hashes },
                         peer_addr,
                     };

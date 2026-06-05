@@ -42,6 +42,7 @@ pub(super) struct SocketWorkerState {
     request_senders: Rc<Senders<ChannelRequest>>,
     registry: PendingResponseRegistry,
     worker_index: usize,
+    response_consumer_id: ConsumerId,
 }
 
 impl SocketWorkerState {
@@ -55,6 +56,10 @@ impl SocketWorkerState {
 
     pub(super) fn worker_index(&self) -> usize {
         self.worker_index
+    }
+
+    pub(super) fn response_consumer_id(&self) -> ConsumerId {
+        self.response_consumer_id
     }
 }
 
@@ -179,6 +184,11 @@ pub async fn run_socket_worker(
         .join(Role::Consumer)
         .await
         .map_err(|err| anyhow::anyhow!("join response mesh: {:#}", err))?;
+    let response_consumer_id = ConsumerId(
+        response_receivers
+            .consumer_id()
+            .ok_or(anyhow::anyhow!("response mesh did not assign consumer id"))?,
+    );
 
     let registry = PendingResponseRegistry::new();
     let response_pumps = spawn_response_pumps(registry.clone(), response_receivers);
@@ -186,6 +196,7 @@ pub async fn run_socket_worker(
         request_senders,
         registry,
         worker_index,
+        response_consumer_id,
     };
 
     let connection_handles = Rc::new(RefCell::new(DenseSlotMap::with_key()));
@@ -406,6 +417,48 @@ mod tests {
 
         assert_eq!(registry.next_request_id(), RequestId(0));
         assert_eq!(registry.next_request_id(), RequestId(1));
+    }
+
+    #[test]
+    fn socket_worker_state_keeps_response_consumer_id_separate() {
+        let request_mesh_builder = MeshBuilder::<ChannelRequest, Partial>::partial(2, 1);
+        let response_mesh_builder = MeshBuilder::<ChannelResponse, Partial>::partial(2, 1);
+
+        let socket = LocalExecutorBuilder::default().spawn(enclose!((
+            request_mesh_builder,
+            response_mesh_builder
+        ) move || async move {
+            let (request_senders, _) = request_mesh_builder
+                .join(Role::Producer)
+                .await
+                .unwrap();
+            let (_, response_receivers) = response_mesh_builder
+                .join(Role::Consumer)
+                .await
+                .unwrap();
+            let response_consumer_id = ConsumerId(response_receivers.consumer_id().unwrap());
+            let worker_index = response_consumer_id.0 + 1;
+            let state = SocketWorkerState {
+                request_senders: Rc::new(request_senders),
+                registry: PendingResponseRegistry::new(),
+                worker_index,
+                response_consumer_id,
+            };
+
+            assert_eq!(state.worker_index(), worker_index);
+            assert_eq!(state.response_consumer_id(), response_consumer_id);
+        }));
+
+        let swarm = LocalExecutorBuilder::default().spawn(enclose!((
+            request_mesh_builder,
+            response_mesh_builder
+        ) move || async move {
+            let _ = request_mesh_builder.join(Role::Consumer).await.unwrap();
+            let _ = response_mesh_builder.join(Role::Producer).await.unwrap();
+        }));
+
+        socket.unwrap().join().unwrap();
+        swarm.unwrap().join().unwrap();
     }
 }
 
