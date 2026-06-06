@@ -11,8 +11,18 @@ pub enum RequestParseError {
     RequiredPeerIpHeaderMissing(anyhow::Error),
     #[error("invalid request")]
     InvalidRequest(anyhow::Error),
+    #[error("method not allowed")]
+    MethodNotAllowed,
     #[error("more data needed")]
     MoreDataNeeded,
+}
+
+/// The request methods this tracker serves. HTTP methods are case-sensitive
+/// (RFC 7231 §4.1) and only these two carry meaning for a tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Head,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,10 +31,17 @@ pub enum HttpRequest {
     StaticIndex,
 }
 
-pub fn parse_request(
-    config: &Config,
-    buffer: &[u8],
-) -> Result<(HttpRequest, Option<IpAddr>), RequestParseError> {
+/// Outcome of parsing a single request from the front of `buffer`.
+pub struct ParsedRequest {
+    pub request: HttpRequest,
+    pub method: HttpMethod,
+    /// Number of bytes consumed from `buffer`. Any bytes after this belong to
+    /// a subsequent (pipelined) request and must be retained by the caller.
+    pub consumed: usize,
+    pub opt_peer_ip: Option<IpAddr>,
+}
+
+pub fn parse_request(config: &Config, buffer: &[u8]) -> Result<ParsedRequest, RequestParseError> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut http_request = httparse::Request::new(&mut headers);
 
@@ -33,7 +50,13 @@ pub fn parse_request(
         .with_context(|| "httparse")
         .map_err(RequestParseError::InvalidRequest)?
     {
-        httparse::Status::Complete(_) => {
+        httparse::Status::Complete(consumed) => {
+            let method = match http_request.method {
+                Some("GET") => HttpMethod::Get,
+                Some("HEAD") => HttpMethod::Head,
+                _ => return Err(RequestParseError::MethodNotAllowed),
+            };
+
             let path = http_request
                 .path
                 .ok_or(anyhow::anyhow!("no http path"))
@@ -63,7 +86,12 @@ pub fn parse_request(
                 None
             };
 
-            Ok((request, opt_peer_ip))
+            Ok(ParsedRequest {
+                request,
+                method,
+                consumed,
+                opt_peer_ip,
+            })
         }
         httparse::Status::Partial => Err(RequestParseError::MoreDataNeeded),
     }
@@ -169,7 +197,7 @@ mod tests {
         assert_eq!(
             parse_request(&config, request.as_bytes())
                 .unwrap()
-                .1
+                .opt_peer_ip
                 .unwrap(),
             expected_ip
         )
@@ -194,7 +222,7 @@ mod tests {
         assert_eq!(
             parse_request(&config, request.as_bytes())
                 .unwrap()
-                .1
+                .opt_peer_ip
                 .unwrap(),
             expected_ip
         )
@@ -218,7 +246,7 @@ mod tests {
         assert_eq!(
             parse_request(&config, request.as_bytes())
                 .unwrap()
-                .1
+                .opt_peer_ip
                 .unwrap(),
             expected_ip
         )
@@ -264,7 +292,7 @@ mod tests {
         assert_eq!(
             parse_request(&config, request.as_bytes())
                 .unwrap()
-                .1
+                .opt_peer_ip
                 .unwrap(),
             expected_ip
         )
@@ -305,10 +333,11 @@ mod tests {
 
         for path in ["/", "/index.html"] {
             let request = format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
-            let (request, opt_peer_ip) = parse_request(&config, request.as_bytes()).unwrap();
+            let parsed = parse_request(&config, request.as_bytes()).unwrap();
 
-            assert_eq!(request, HttpRequest::StaticIndex);
-            assert!(opt_peer_ip.is_none());
+            assert_eq!(parsed.request, HttpRequest::StaticIndex);
+            assert_eq!(parsed.method, HttpMethod::Get);
+            assert!(parsed.opt_peer_ip.is_none());
         }
 
         let mut request = String::from("GET / HTTP/1.1\r\n");
@@ -319,9 +348,51 @@ mod tests {
 
         request.push_str("\r\n");
 
-        let (request, opt_peer_ip) = parse_request(&config, request.as_bytes()).unwrap();
+        let parsed = parse_request(&config, request.as_bytes()).unwrap();
 
-        assert_eq!(request, HttpRequest::StaticIndex);
-        assert!(opt_peer_ip.is_none());
+        assert_eq!(parsed.request, HttpRequest::StaticIndex);
+        assert!(parsed.opt_peer_ip.is_none());
+    }
+
+    #[test]
+    fn test_parse_head_method_is_accepted() {
+        let config = Config::default();
+        let request = "HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let parsed = parse_request(&config, request.as_bytes()).unwrap();
+
+        assert_eq!(parsed.request, HttpRequest::StaticIndex);
+        assert_eq!(parsed.method, HttpMethod::Head);
+    }
+
+    #[test]
+    fn test_parse_unsupported_method_is_rejected() {
+        let config = Config::default();
+
+        for method in ["POST", "PUT", "DELETE", "OPTIONS", "get"] {
+            let request = format!("{method} / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let res = parse_request(&config, request.as_bytes());
+
+            assert!(
+                matches!(res, Err(RequestParseError::MethodNotAllowed)),
+                "{method} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_reports_consumed_length_and_leaves_pipelined_request() {
+        let config = Config::default();
+
+        let first = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let second = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let combined = format!("{first}{second}");
+
+        let parsed = parse_request(&config, combined.as_bytes()).unwrap();
+
+        assert_eq!(parsed.request, HttpRequest::StaticIndex);
+        // Only the first request must be consumed, leaving the second intact.
+        assert_eq!(parsed.consumed, first.len());
+        assert_eq!(&combined.as_bytes()[parsed.consumed..], second.as_bytes());
     }
 }

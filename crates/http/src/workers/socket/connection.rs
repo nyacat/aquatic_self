@@ -26,7 +26,7 @@ use crate::config::Config;
 
 #[cfg(feature = "metrics")]
 use super::peer_addr_to_ip_version_str;
-use super::request::{parse_request, HttpRequest, RequestParseError};
+use super::request::{parse_request, HttpMethod, HttpRequest, RequestParseError};
 use super::{PendingResponseGuard, SocketWorkerState};
 
 const REQUEST_BUFFER_SIZE: usize = 16 * 1024;
@@ -45,6 +45,11 @@ const RESPONSE_HEADER_TAIL: &[u8] = b"\r\n\r\n";
 const RESPONSE_HEADER_TAIL_CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 const STATIC_INDEX_HEADER_A: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
+/// Sent verbatim for any request whose method is not GET or HEAD. The tracker
+/// only serves those two methods, so RFC 7231 §6.5.5 requires a 405 with an
+/// `Allow` header advertising the supported set. The connection is closed
+/// afterwards, so it also carries `Connection: close`.
+const METHOD_NOT_ALLOWED_RESPONSE: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 #[inline]
 fn response_header_tail(keep_alive: bool) -> &'static [u8] {
@@ -70,6 +75,8 @@ pub enum ConnectionError {
     RequestBufferFull,
     #[error("request parse error: {0}")]
     RequestParse(anyhow::Error),
+    #[error("method not allowed")]
+    MethodNotAllowed,
     #[error("response buffer full")]
     ResponseBufferFull,
     #[error("response buffer write error: {0}")]
@@ -188,21 +195,31 @@ where
 
         loop {
             let read_timeout_ms = self.config.network.request_read_timeout_ms;
-            let (request, opt_peer_addr) =
+            let (request, method, opt_peer_addr) =
                 match request_read_timeout(read_timeout_ms, self.read_request()).await {
                     Ok(request) => request,
+                    // Method rejection has its own status line, so it is handled
+                    // before the generic bencoded failure responses.
+                    Err(ConnectionError::MethodNotAllowed) => {
+                        self.write_method_not_allowed_response().await?;
+
+                        break;
+                    }
                     Err(err) => match request_read_error_response(err) {
                         Ok(response) => {
                             // The request framing is broken, so the connection
                             // is always closed after this error response,
                             // regardless of the keep_alive setting.
-                            self.write_response(&response, None, false).await?;
+                            self.write_response(&response, None, false, false).await?;
 
                             break;
                         }
                         Err(err) => return Err(err),
                     },
                 };
+
+            // A HEAD response carries identical headers to GET but no body.
+            let head = matches!(method, HttpMethod::Head);
 
             match request {
                 HttpRequest::Tracker(request) => {
@@ -212,11 +229,11 @@ where
 
                     let response = self.handle_request(request, peer_addr).await?;
 
-                    self.write_response(&response, Some(peer_addr), keep_alive)
+                    self.write_response(&response, Some(peer_addr), keep_alive, head)
                         .await?;
                 }
                 HttpRequest::StaticIndex => {
-                    self.write_static_index_response(keep_alive).await?;
+                    self.write_static_index_response(keep_alive, head).await?;
                 }
             }
 
@@ -230,10 +247,54 @@ where
 
     async fn read_request(
         &mut self,
-    ) -> Result<(HttpRequest, Option<CanonicalSocketAddr>), ConnectionError> {
-        self.request_buffer_position = 0;
-
+    ) -> Result<(HttpRequest, HttpMethod, Option<CanonicalSocketAddr>), ConnectionError> {
+        // Note: request_buffer_position is NOT reset here. On a keep-alive
+        // connection it may already hold the bytes of a pipelined request that
+        // arrived together with the previous one (see the buffer shift below),
+        // so we attempt to parse what is buffered before reading more.
         loop {
+            if self.request_buffer_position != 0 {
+                match parse_request(
+                    &self.config,
+                    &self.request_buffer[..self.request_buffer_position],
+                ) {
+                    Ok(parsed) => {
+                        let opt_peer_addr = if self.config.network.runs_behind_reverse_proxy
+                            && matches!(parsed.request, HttpRequest::Tracker(_))
+                        {
+                            let peer_ip = parsed.opt_peer_ip.expect(
+                                "logic error: peer ip must have been extracted at this point",
+                            );
+
+                            Some(CanonicalSocketAddr::new(SocketAddr::new(
+                                peer_ip,
+                                self.peer_port,
+                            )))
+                        } else {
+                            None
+                        };
+
+                        // Retain any trailing bytes (a pipelined next request)
+                        // at the front of the buffer for the following call.
+                        self.request_buffer
+                            .copy_within(parsed.consumed..self.request_buffer_position, 0);
+                        self.request_buffer_position -= parsed.consumed;
+
+                        return Ok((parsed.request, parsed.method, opt_peer_addr));
+                    }
+                    Err(RequestParseError::MoreDataNeeded) => {}
+                    Err(RequestParseError::MethodNotAllowed) => {
+                        return Err(ConnectionError::MethodNotAllowed);
+                    }
+                    Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
+                        return Err(required_peer_ip_header_missing_error(err));
+                    }
+                    Err(RequestParseError::InvalidRequest(err)) => {
+                        return Err(ConnectionError::RequestParse(err));
+                    }
+                }
+            }
+
             if self.request_buffer_position == self.request_buffer.len() {
                 return Err(ConnectionError::RequestBufferFull);
             }
@@ -249,35 +310,6 @@ where
             }
 
             self.request_buffer_position += bytes_read;
-
-            let buffer_slice = &self.request_buffer[..self.request_buffer_position];
-
-            match parse_request(&self.config, buffer_slice) {
-                Ok((request, opt_peer_ip)) => {
-                    let opt_peer_addr = if self.config.network.runs_behind_reverse_proxy
-                        && matches!(request, HttpRequest::Tracker(_))
-                    {
-                        let peer_ip = opt_peer_ip
-                            .expect("logic error: peer ip must have been extracted at this point");
-
-                        Some(CanonicalSocketAddr::new(SocketAddr::new(
-                            peer_ip,
-                            self.peer_port,
-                        )))
-                    } else {
-                        None
-                    };
-
-                    return Ok((request, opt_peer_addr));
-                }
-                Err(RequestParseError::MoreDataNeeded) => continue,
-                Err(RequestParseError::RequiredPeerIpHeaderMissing(err)) => {
-                    return Err(required_peer_ip_header_missing_error(err));
-                }
-                Err(RequestParseError::InvalidRequest(err)) => {
-                    return Err(ConnectionError::RequestParse(err));
-                }
-            }
         }
     }
 
@@ -490,12 +522,20 @@ where
         response: &Response,
         opt_peer_addr: Option<CanonicalSocketAddr>,
         keep_alive: bool,
+        head: bool,
     ) -> Result<(), ConnectionError> {
-        let position = write_response_to_buffer(&mut self.response_buffer, response, keep_alive)?;
+        let ResponseBuffer {
+            header_len,
+            total_len,
+        } = write_response_to_buffer(&mut self.response_buffer, response, keep_alive)?;
+
+        // For HEAD, send the headers (with the body's Content-Length) but omit
+        // the body itself.
+        let end = if head { header_len } else { total_len };
 
         write_response_bytes_to_stream(
             &mut self.stream,
-            &self.response_buffer[..position],
+            &self.response_buffer[..end],
             self.config.network.enable_tls,
         )
         .await?;
@@ -532,17 +572,32 @@ where
     async fn write_static_index_response(
         &mut self,
         keep_alive: bool,
+        head: bool,
     ) -> Result<(), ConnectionError> {
         let static_index = self.static_index_cache.load();
-        let position = write_static_index_response_to_buffer(
+        let ResponseBuffer {
+            header_len,
+            total_len,
+        } = write_static_index_response_to_buffer(
             &mut self.response_buffer,
             static_index.body(),
             keep_alive,
         )?;
 
+        let end = if head { header_len } else { total_len };
+
         write_response_bytes_to_stream(
             &mut self.stream,
-            &self.response_buffer[..position],
+            &self.response_buffer[..end],
+            self.config.network.enable_tls,
+        )
+        .await
+    }
+
+    async fn write_method_not_allowed_response(&mut self) -> Result<(), ConnectionError> {
+        write_response_bytes_to_stream(
+            &mut self.stream,
+            METHOD_NOT_ALLOWED_RESPONSE,
             self.config.network.enable_tls,
         )
         .await
@@ -597,11 +652,20 @@ fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usi
     (info_hash.0[0] as usize) % config.swarm_workers
 }
 
+/// Byte offsets into a written response buffer, so the caller can send only the
+/// header block (HEAD) or the whole message (GET).
+struct ResponseBuffer {
+    /// Length of the header block, including the terminating `\r\n\r\n`.
+    header_len: usize,
+    /// Length of the full message (headers + body).
+    total_len: usize,
+}
+
 fn write_response_to_buffer(
     response_buffer: &mut Vec<u8>,
     response: &Response,
     keep_alive: bool,
-) -> Result<usize, ConnectionError> {
+) -> Result<ResponseBuffer, ConnectionError> {
     response_buffer.clear();
     response_buffer.extend_from_slice(RESPONSE_HEADER_A);
     response_buffer.extend_from_slice(RESPONSE_HEADER_CONTENT_LENGTH_PADDING);
@@ -631,14 +695,17 @@ fn write_response_to_buffer(
         response_buffer[start..end].copy_from_slice(content_len_bytes);
     }
 
-    Ok(response_buffer.len())
+    Ok(ResponseBuffer {
+        header_len: body_start,
+        total_len: response_buffer.len(),
+    })
 }
 
 fn write_static_index_response_to_buffer(
     response_buffer: &mut Vec<u8>,
     body: &[u8],
     keep_alive: bool,
-) -> Result<usize, ConnectionError> {
+) -> Result<ResponseBuffer, ConnectionError> {
     response_buffer.clear();
     response_buffer.extend_from_slice(STATIC_INDEX_HEADER_A);
 
@@ -652,9 +719,15 @@ fn write_static_index_response_to_buffer(
     response_buffer.extend_from_slice(buf.format(body.len()).as_bytes());
 
     response_buffer.extend_from_slice(response_header_tail(keep_alive));
+
+    let header_len = response_buffer.len();
+
     response_buffer.extend_from_slice(body);
 
-    Ok(response_buffer.len())
+    Ok(ResponseBuffer {
+        header_len,
+        total_len: response_buffer.len(),
+    })
 }
 
 fn required_peer_ip_header_missing_error(err: anyhow::Error) -> ConnectionError {
@@ -903,7 +976,7 @@ mod tests {
 
         let written = write_response_to_buffer(&mut response_buffer, &response, true).unwrap();
 
-        assert_eq!(written, response_buffer.len());
+        assert_eq!(written.total_len, response_buffer.len());
         assert!(response_buffer.len() > RESPONSE_BUFFER_SIZE);
         assert!(response_buffer.starts_with(RESPONSE_HEADER_A));
         assert!(response_buffer.ends_with(b"\r\n"));
@@ -912,6 +985,10 @@ mod tests {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .unwrap();
+
+        // header_len points just past the terminating CRLFCRLF, i.e. the byte
+        // boundary used to suppress the body for HEAD requests.
+        assert_eq!(written.header_len, header_end + 4);
         let header = std::str::from_utf8(&response_buffer[..header_end]).unwrap();
         let content_len = header
             .strip_prefix("HTTP/1.1 200 OK\r\nContent-Length: ")
@@ -931,11 +1008,12 @@ mod tests {
         let written =
             write_static_index_response_to_buffer(&mut response_buffer, body, true).unwrap();
 
-        assert_eq!(written, response_buffer.len());
+        assert_eq!(written.total_len, response_buffer.len());
 
         let response = std::str::from_utf8(&response_buffer).unwrap();
 
         let header_end = response.find("\r\n\r\n").unwrap();
+        assert_eq!(written.header_len, header_end + 4);
         let header = &response[..header_end];
         let content_len = header
             .strip_prefix(
