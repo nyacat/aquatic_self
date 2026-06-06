@@ -38,19 +38,9 @@ const RESPONSE_HEADER_B: &[u8] = b"        ";
 const RESPONSE_HEADER_C: &[u8] = b"\r\n\r\n";
 const STATIC_INDEX_HEADER_A: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
-const STATIC_INDEX_HEADER_B: &[u8] = b"        ";
-const STATIC_INDEX_HEADER_C: &[u8] = b"\r\n\r\n";
 
 static RESPONSE_HEADER: Lazy<Vec<u8>> =
     Lazy::new(|| [RESPONSE_HEADER_A, RESPONSE_HEADER_B, RESPONSE_HEADER_C].concat());
-static STATIC_INDEX_HEADER: Lazy<Vec<u8>> = Lazy::new(|| {
-    [
-        STATIC_INDEX_HEADER_A,
-        STATIC_INDEX_HEADER_B,
-        STATIC_INDEX_HEADER_C,
-    ]
-    .concat()
-});
 
 struct PendingScrapeResponse {
     pending_worker_responses: usize,
@@ -620,22 +610,18 @@ fn write_static_index_response_to_buffer(
     body: &[u8],
 ) -> Result<usize, ConnectionError> {
     response_buffer.clear();
-    response_buffer.extend_from_slice(&STATIC_INDEX_HEADER);
+    response_buffer.extend_from_slice(STATIC_INDEX_HEADER_A);
 
-    {
-        let mut buf = ::itoa::Buffer::new();
-        let content_len_bytes = buf.format(body.len()).as_bytes();
+    // Write the exact content length. Unlike the tracker hot path, the static
+    // index is a rarely-hit, fixed-size page, so there is no need to reserve a
+    // padded placeholder. Padding the value with trailing spaces produces a
+    // technically-tolerated but non-compliant `Content-Length`, which trips up
+    // strict reverse proxies (e.g. Cloudflare buffering text/html responses)
+    // and causes them to mis-frame the body.
+    let mut buf = ::itoa::Buffer::new();
+    response_buffer.extend_from_slice(buf.format(body.len()).as_bytes());
 
-        let start = STATIC_INDEX_HEADER_A.len();
-        let end = start + content_len_bytes.len();
-
-        if end > STATIC_INDEX_HEADER_A.len() + STATIC_INDEX_HEADER_B.len() {
-            return Err(ConnectionError::ResponseBufferFull);
-        }
-
-        response_buffer[start..end].copy_from_slice(content_len_bytes);
-    }
-
+    response_buffer.extend_from_slice(b"\r\n\r\n");
     response_buffer.extend_from_slice(body);
 
     Ok(response_buffer.len())
@@ -934,6 +920,11 @@ mod tests {
         ));
         assert_eq!(content_len, body.len());
         assert!(response.ends_with("<!doctype html><title>aquatic</title>"));
+
+        // The Content-Length value must be exact, with no padding whitespace:
+        // a trailing-space value is non-compliant and breaks strict reverse
+        // proxies that buffer the response body.
+        assert!(response.contains(&format!("Content-Length: {}\r\n\r\n", body.len())));
     }
 
     #[test]
