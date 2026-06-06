@@ -245,7 +245,9 @@ where
 
             match parse_request(&self.config, buffer_slice) {
                 Ok((request, opt_peer_ip)) => {
-                    let opt_peer_addr = if self.config.network.runs_behind_reverse_proxy {
+                    let opt_peer_addr = if self.config.network.runs_behind_reverse_proxy
+                        && matches!(request, HttpRequest::Tracker(_))
+                    {
                         let peer_ip = opt_peer_ip
                             .expect("logic error: peer ip must have been extracted at this point");
 
