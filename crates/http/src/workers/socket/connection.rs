@@ -20,7 +20,6 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use futures_rustls::TlsAcceptor;
 use glommio::net::TcpStream;
 use glommio::timer::Timer;
-use once_cell::sync::Lazy;
 
 use crate::common::*;
 use crate::config::Config;
@@ -34,13 +33,27 @@ const REQUEST_BUFFER_SIZE: usize = 16 * 1024;
 const RESPONSE_BUFFER_SIZE: usize = 4096;
 
 const RESPONSE_HEADER_A: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: ";
-const RESPONSE_HEADER_B: &[u8] = b"        ";
-const RESPONSE_HEADER_C: &[u8] = b"\r\n\r\n";
+/// Placeholder reserving space for the Content-Length digits, patched in place
+/// once the body length is known (see `write_response_to_buffer`).
+const RESPONSE_HEADER_CONTENT_LENGTH_PADDING: &[u8] = b"        ";
+/// Header-block terminator for a persistent (keep-alive) connection.
+const RESPONSE_HEADER_TAIL: &[u8] = b"\r\n\r\n";
+/// Header-block terminator when the connection will be closed after this
+/// response. HTTP/1.1 defaults to persistent connections, so RFC 7230 §6.1
+/// requires a server that is about to close to advertise `Connection: close`;
+/// otherwise clients/proxies keep the socket pooled and fail on reuse.
+const RESPONSE_HEADER_TAIL_CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 const STATIC_INDEX_HEADER_A: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ";
 
-static RESPONSE_HEADER: Lazy<Vec<u8>> =
-    Lazy::new(|| [RESPONSE_HEADER_A, RESPONSE_HEADER_B, RESPONSE_HEADER_C].concat());
+#[inline]
+fn response_header_tail(keep_alive: bool) -> &'static [u8] {
+    if keep_alive {
+        RESPONSE_HEADER_TAIL
+    } else {
+        RESPONSE_HEADER_TAIL_CONNECTION_CLOSE
+    }
+}
 
 struct PendingScrapeResponse {
     pending_worker_responses: usize,
@@ -171,6 +184,8 @@ where
         // Set unless running behind reverse proxy
         opt_stable_peer_addr: Option<CanonicalSocketAddr>,
     ) -> Result<(), ConnectionError> {
+        let keep_alive = self.config.network.keep_alive;
+
         loop {
             let read_timeout_ms = self.config.network.request_read_timeout_ms;
             let (request, opt_peer_addr) =
@@ -178,7 +193,10 @@ where
                     Ok(request) => request,
                     Err(err) => match request_read_error_response(err) {
                         Ok(response) => {
-                            self.write_response(&response, None).await?;
+                            // The request framing is broken, so the connection
+                            // is always closed after this error response,
+                            // regardless of the keep_alive setting.
+                            self.write_response(&response, None, false).await?;
 
                             break;
                         }
@@ -194,14 +212,15 @@ where
 
                     let response = self.handle_request(request, peer_addr).await?;
 
-                    self.write_response(&response, Some(peer_addr)).await?;
+                    self.write_response(&response, Some(peer_addr), keep_alive)
+                        .await?;
                 }
                 HttpRequest::StaticIndex => {
-                    self.write_static_index_response().await?;
+                    self.write_static_index_response(keep_alive).await?;
                 }
             }
 
-            if !self.config.network.keep_alive {
+            if !keep_alive {
                 break;
             }
         }
@@ -470,8 +489,9 @@ where
         &mut self,
         response: &Response,
         opt_peer_addr: Option<CanonicalSocketAddr>,
+        keep_alive: bool,
     ) -> Result<(), ConnectionError> {
-        let position = write_response_to_buffer(&mut self.response_buffer, response)?;
+        let position = write_response_to_buffer(&mut self.response_buffer, response, keep_alive)?;
 
         write_response_bytes_to_stream(
             &mut self.stream,
@@ -509,10 +529,16 @@ where
         Ok(())
     }
 
-    async fn write_static_index_response(&mut self) -> Result<(), ConnectionError> {
+    async fn write_static_index_response(
+        &mut self,
+        keep_alive: bool,
+    ) -> Result<(), ConnectionError> {
         let static_index = self.static_index_cache.load();
-        let position =
-            write_static_index_response_to_buffer(&mut self.response_buffer, static_index.body())?;
+        let position = write_static_index_response_to_buffer(
+            &mut self.response_buffer,
+            static_index.body(),
+            keep_alive,
+        )?;
 
         write_response_bytes_to_stream(
             &mut self.stream,
@@ -574,9 +600,12 @@ fn calculate_request_consumer_index(config: &Config, info_hash: InfoHash) -> usi
 fn write_response_to_buffer(
     response_buffer: &mut Vec<u8>,
     response: &Response,
+    keep_alive: bool,
 ) -> Result<usize, ConnectionError> {
     response_buffer.clear();
-    response_buffer.extend_from_slice(&RESPONSE_HEADER);
+    response_buffer.extend_from_slice(RESPONSE_HEADER_A);
+    response_buffer.extend_from_slice(RESPONSE_HEADER_CONTENT_LENGTH_PADDING);
+    response_buffer.extend_from_slice(response_header_tail(keep_alive));
 
     let body_start = response_buffer.len();
 
@@ -595,7 +624,7 @@ fn write_response_to_buffer(
         let start = RESPONSE_HEADER_A.len();
         let end = start + content_len_bytes.len();
 
-        if end > RESPONSE_HEADER_A.len() + RESPONSE_HEADER_B.len() {
+        if end > RESPONSE_HEADER_A.len() + RESPONSE_HEADER_CONTENT_LENGTH_PADDING.len() {
             return Err(ConnectionError::ResponseBufferFull);
         }
 
@@ -608,6 +637,7 @@ fn write_response_to_buffer(
 fn write_static_index_response_to_buffer(
     response_buffer: &mut Vec<u8>,
     body: &[u8],
+    keep_alive: bool,
 ) -> Result<usize, ConnectionError> {
     response_buffer.clear();
     response_buffer.extend_from_slice(STATIC_INDEX_HEADER_A);
@@ -621,7 +651,7 @@ fn write_static_index_response_to_buffer(
     let mut buf = ::itoa::Buffer::new();
     response_buffer.extend_from_slice(buf.format(body.len()).as_bytes());
 
-    response_buffer.extend_from_slice(b"\r\n\r\n");
+    response_buffer.extend_from_slice(response_header_tail(keep_alive));
     response_buffer.extend_from_slice(body);
 
     Ok(response_buffer.len())
@@ -774,7 +804,7 @@ mod tests {
             let response = request_parse_error_response(err);
             let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
 
-            write_response_to_buffer(&mut response_buffer, &response).unwrap();
+            write_response_to_buffer(&mut response_buffer, &response, true).unwrap();
 
             let response = std::str::from_utf8(&response_buffer).unwrap();
 
@@ -793,7 +823,7 @@ mod tests {
         let response = request_read_error_response(ConnectionError::RequestBufferFull).unwrap();
         let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
 
-        write_response_to_buffer(&mut response_buffer, &response).unwrap();
+        write_response_to_buffer(&mut response_buffer, &response, true).unwrap();
 
         let response = std::str::from_utf8(&response_buffer).unwrap();
 
@@ -871,7 +901,7 @@ mod tests {
         });
         let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
 
-        let written = write_response_to_buffer(&mut response_buffer, &response).unwrap();
+        let written = write_response_to_buffer(&mut response_buffer, &response, true).unwrap();
 
         assert_eq!(written, response_buffer.len());
         assert!(response_buffer.len() > RESPONSE_BUFFER_SIZE);
@@ -898,7 +928,8 @@ mod tests {
         let body = b"<!doctype html><title>aquatic</title>";
         let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
 
-        let written = write_static_index_response_to_buffer(&mut response_buffer, body).unwrap();
+        let written =
+            write_static_index_response_to_buffer(&mut response_buffer, body, true).unwrap();
 
         assert_eq!(written, response_buffer.len());
 
@@ -925,6 +956,68 @@ mod tests {
         // a trailing-space value is non-compliant and breaks strict reverse
         // proxies that buffer the response body.
         assert!(response.contains(&format!("Content-Length: {}\r\n\r\n", body.len())));
+    }
+
+    #[test]
+    fn keep_alive_response_omits_connection_close_header() {
+        let response = internal_error_response();
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        write_response_to_buffer(&mut response_buffer, &response, true).unwrap();
+
+        let response = std::str::from_utf8(&response_buffer).unwrap();
+        let header = &response[..response.find("\r\n\r\n").unwrap()];
+
+        assert!(
+            !header.to_ascii_lowercase().contains("connection:"),
+            "persistent connection must not advertise a Connection header, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn non_keep_alive_response_advertises_connection_close() {
+        let response = internal_error_response();
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        write_response_to_buffer(&mut response_buffer, &response, false).unwrap();
+
+        let response = std::str::from_utf8(&response_buffer).unwrap();
+        let header_end = response.find("\r\n\r\n").unwrap();
+        let header = &response[..header_end];
+
+        // The Connection: close header must live inside the header block.
+        assert!(
+            header.contains("\r\nConnection: close"),
+            "closing connection must advertise Connection: close, got: {header:?}"
+        );
+
+        // Body framing must stay correct: Content-Length still matches the body.
+        let content_len = header
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+
+        assert_eq!(content_len, response.len() - header_end - 4);
+    }
+
+    #[test]
+    fn non_keep_alive_static_index_advertises_connection_close() {
+        let body = b"<!doctype html><title>aquatic</title>";
+        let mut response_buffer = Vec::with_capacity(RESPONSE_BUFFER_SIZE);
+
+        write_static_index_response_to_buffer(&mut response_buffer, body, false).unwrap();
+
+        let response = std::str::from_utf8(&response_buffer).unwrap();
+        let header = &response[..response.find("\r\n\r\n").unwrap()];
+
+        assert!(
+            header.contains("\r\nConnection: close"),
+            "closing connection must advertise Connection: close, got: {header:?}"
+        );
+        assert!(response.ends_with("<!doctype html><title>aquatic</title>"));
     }
 
     #[test]
